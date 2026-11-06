@@ -9,6 +9,12 @@ This repository is the distribution: the installers, the Kubernetes templates, t
 module and the documentation. The kernel ships only as a published container image,
 `ghcr.io/emeraldcoastsystemsgroup/oswarm`; its source code is not part of this repository.
 
+**Licensing.** The oswarm server (the container image and the `oshald` and `oshal-node` binaries in it) is
+licensed under [BINARY-LICENSE.md](BINARY-LICENSE.md): free to download and run, including commercially, on
+machines you control; **not** to redistribute, resell, sublicense or offer to others as a hosted service, and
+not to modify or reverse engineer. Only the files in this repository (installers, templates, Terraform and
+documentation) are under the Apache License 2.0 in [LICENSE](LICENSE). Commercial terms: oss@oswarm.ai.
+
 ## Quick start
 
 There are two installations: **Swarm** runs your server; **Orbit** connects a
