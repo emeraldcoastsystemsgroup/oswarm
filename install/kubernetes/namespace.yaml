@@ -1,0 +1,10 @@
+# -----------------------------------------------------------------------------
+# SEQ                 | AUTHOR                      | DESCRIPTION
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oshal-kernel
+  labels:
+    app.kubernetes.io/name: oshal-kernel
+    app.kubernetes.io/part-of: oshal

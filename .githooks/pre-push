@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Runs scripts/publish-gate.sh on every push (git config core.hooksPath .githooks).
+exec bash "$(git rev-parse --show-toplevel)/scripts/publish-gate.sh" --pre-push

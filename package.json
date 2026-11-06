@@ -1,0 +1,31 @@
+{
+  "name": "oswarm",
+  "version": "0.7.1",
+  "description": "Install and manage your Open Swarm server with Docker or a dedicated local Kubernetes cluster.",
+  "license": "SEE LICENSE IN LICENSE",
+  "bin": {
+    "oswarm": "bin/oshal-swarm.cjs",
+    "oshal-swarm": "bin/oshal-swarm.cjs"
+  },
+  "files": [
+    "bin/",
+    "install/",
+    "README.md",
+    "LICENSE",
+    "BINARY-LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/emeraldcoastsystemsgroup/oswarm.git"
+  },
+  "scripts": {
+    "test": "node --test scripts/installer-*.test.cjs scripts/kubernetes-installer.test.cjs",
+    "prepublishOnly": "node scripts/check-image-release.cjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

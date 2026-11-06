@@ -1,0 +1,90 @@
+# oswarm on Docker Compose: the kernel and its PostgreSQL.
+#
+# The installer copies this file next to the files it generates (.env, runtime.env, postgres.env,
+# applications/) in the installation directory. Nothing in this file holds a secret.
+name: ${OSWARM_PROJECT:-oswarm}
+
+services:
+  kernel:
+    image: ${OSWARM_IMAGE:?Set OSWARM_IMAGE in .env (the published oswarm image)}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      # Linux hosts with AppArmor: the installer loads this profile first. Hosts
+      # without AppArmor (Docker Desktop) ignore the option.
+      - apparmor=${OSWARM_APPARMOR_PROFILE:-oshal-bwrap}
+      # Moby's default seccomp profile plus the namespace calls Bubblewrap needs for each
+      # application's private sandbox.
+      - seccomp=./seccomp-bwrap.json
+      - systempaths=unconfined
+    cpus: ${OSWARM_KERNEL_CPUS:-2}
+    mem_limit: ${OSWARM_KERNEL_MEMORY:-2g}
+    # Application engines run inside this container, each in its own sandbox.
+    pids_limit: ${OSWARM_KERNEL_PIDS:-4096}
+    stop_grace_period: 30s
+    ports: ["${OSWARM_BIND_ADDRESS:-127.0.0.1}:${OSWARM_PORT:-38788}:38788"]
+    env_file: [runtime.env]
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      OSHAL_BIND: 0.0.0.0:38788
+      OSHAL_DEPLOYMENT: ${OSWARM_DEPLOYMENT:-home}
+      OSHAL_PUBLIC_URL: ${OSWARM_PUBLIC_URL:-http://127.0.0.1:38788}
+      OSHAL_PACKAGE_DIR: /var/lib/oshal/packages
+      OSHAL_PACKAGE_DATA_DIR: /var/lib/oshal/package-data
+      OSHAL_CAREER_DATA_DIR: /var/lib/oshal/career
+      OSHAL_APPLICATION_FILES_DIR: /var/lib/oshal/application-files
+      OSHAL_APPLICATIONS_DIR: /opt/oshal/applications
+      OSHAL_APP_PRIVATE_DIR: /opt/oshal/private-applications
+      OSHAL_ADDITIONAL_APPLICATIONS_DIRS: /opt/oshal/additional-applications
+      OSHAL_PLATFORM_DIR: /app/platform
+      OSHAL_FLEET_PROVIDER: ${OSWARM_FLEET_PROVIDER:-noop}
+      OSHAL_FLEET_MODEL: ${OSWARM_FLEET_MODEL:-noop-1}
+    volumes:
+      - kernel_state:/var/lib/oshal
+      - type: bind
+        source: ./applications
+        target: /opt/oshal/applications
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs: ["/tmp:rw,nosuid,nodev,size=256m,mode=1777"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [database, runtime]
+
+  postgres:
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    restart: unless-stopped
+    user: "70:70"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${OSWARM_POSTGRES_MEMORY:-512m}
+    pids_limit: 128
+    env_file: [postgres.env]
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes: [postgres_state:/var/lib/postgresql/data]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=32m,mode=1777
+      - /var/run/postgresql:rw,nosuid,nodev,size=16m,uid=70,gid=70,mode=0755
+    networks: [database]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d oshal"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  kernel_state:
+  postgres_state:
+
+networks:
+  database:
+    internal: true
+  runtime:

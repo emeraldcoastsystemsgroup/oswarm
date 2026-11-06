@@ -1,0 +1,560 @@
+[
+  {
+    "apiVersion": "v1",
+    "kind": "Namespace",
+    "metadata": {
+      "name": "oshal-kernel",
+      "labels": {
+        "app.kubernetes.io/name": "oshal-kernel",
+        "app.kubernetes.io/part-of": "oshal"
+      }
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "ConfigMap",
+    "metadata": {
+      "OSHAL_COST_ESTIMATE_PER_MTOK_IN": "1.00",
+      "OSHAL_COST_ESTIMATE_PER_MTOK_OUT": "3.00",
+      "name": "oshal-kernel-config",
+      "namespace": "oshal-kernel"
+    },
+    "data": {
+      "OSHAL_CODE_SERVER_URL": "http://127.0.0.1:8444",
+      "OSHAL_BIND": "0.0.0.0:38788",
+      "OSHAL_WORKSPACE_ROOT": "/app/workspace-shared",
+      "WORKSPACE_DIR": "/app/workspace-shared",
+      "SHARED_WORKSPACE_ROOT": "/app/workspace-shared",
+      "CLINE_SHARED_WORKSPACE_ROOT": "/app/workspace-shared",
+      "CLINE_WORKSPACE_ROOT": "/app/workspace-shared",
+      "WORKSPACE_ROOT": "/app/workspace-shared",
+      "OSHAL_DEPLOYMENT": "enterprise",
+      "OSHAL_MOCK_IDENTITY": "false",
+      "OSHAL_PACKAGE_RUNTIME": "/usr/bin/node",
+      "OSHAL_BRIDGE_RUNNER": "/app/bridge/runner.js",
+      "OSHAL_PACKAGE_DIR": "/var/lib/oshal/packages",
+      "OSHAL_JOURNAL_PATH": "/var/lib/oshal/mesh.jsonl",
+      "OSHAL_LEDGER_SPILL_PATH": "/var/lib/oshal/ledger-spill.jsonl",
+      "OSHAL_COMPANION_ARTIFACT_DIR": "/var/lib/oshal/artifacts",
+      "OSHAL_CAREER_DATA_DIR": "/var/lib/oshal/career",
+      "OSHAL_APPLICATION_FILES_DIR": "/var/lib/oshal/application-files",
+      "OSHAL_APPLICATIONS_DIR": "/opt/oshal/applications",
+      "OSHAL_APP_PRIVATE_DIR": "/opt/oshal/private-applications",
+      "OSHAL_PLATFORM_DIR": "/app/platform",
+      "OSHAL_ADDITIONAL_APPLICATIONS_DIRS": "/opt/oshal/migrated-applications",
+      "OSHAL_FLEET_PROVIDER": "noop",
+      "OSHAL_FLEET_MODEL": "noop-1"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "ConfigMap",
+    "metadata": {
+      "name": "oshal-kernel-endpoints",
+      "namespace": "oshal-kernel"
+    },
+    "data": {}
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolumeClaim",
+    "metadata": {
+      "name": "oshal-kernel-state",
+      "namespace": "oshal-kernel"
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOncePod"
+      ],
+      "storageClassName": "REQUIRED_STATE_STORAGE_CLASS",
+      "resources": {
+        "requests": {
+          "storage": "20Gi"
+        }
+      }
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolumeClaim",
+    "metadata": {
+      "name": "oshal-workspace",
+      "namespace": "oshal-kernel",
+      "annotations": {
+        "helm.sh/resource-policy": "keep"
+      }
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOnce"
+      ],
+      "storageClassName": "REQUIRED_WORKSPACE_STORAGE_CLASS",
+      "resources": {
+        "requests": {
+          "storage": "5Gi"
+        }
+      }
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolumeClaim",
+    "metadata": {
+      "name": "oshal-kernel-applications",
+      "namespace": "oshal-kernel"
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOnce"
+      ],
+      "storageClassName": "REQUIRED_BUNDLE_STORAGE_CLASS",
+      "resources": {
+        "requests": {
+          "storage": "20Gi"
+        }
+      }
+    }
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {
+      "name": "oshal-kernel-deployment",
+      "namespace": "oshal-kernel",
+      "labels": {
+        "app.kubernetes.io/name": "oshal-kernel",
+        "app.kubernetes.io/instance": "oshal-kernel-k8s"
+      }
+    },
+    "spec": {
+      "replicas": 1,
+      "strategy": {
+        "type": "Recreate"
+      },
+      "selector": {
+        "matchLabels": {
+          "app.kubernetes.io/name": "oshal-kernel",
+          "app.kubernetes.io/instance": "oshal-kernel-k8s"
+        }
+      },
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/name": "oshal-kernel",
+            "app.kubernetes.io/instance": "oshal-kernel-k8s"
+          },
+          "annotations": {
+            "oshal.io/source-revision": "46bbf14d1fcba72bdd30c273810e889948f88d1c",
+            "oshal.io/application-bundle-sha256": "REQUIRED_REVIEWED_BUNDLE_SHA256"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "terminationGracePeriodSeconds": 30,
+          "hostUsers": false,
+          "nodeSelector": {
+            "kubernetes.io/os": "linux",
+            "oshal.io/sandbox-ready": "true"
+          },
+          "securityContext": {
+            "runAsNonRoot": true,
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "fsGroup": 10001,
+            "fsGroupChangePolicy": "OnRootMismatch"
+          },
+          "containers": [
+            {
+              "name": "oshal-kernel",
+              "image": "ghcr.io/emeraldcoastsystemsgroup/oswarm:0.7.1@sha256:1731a07d146774cb764a839cabf2dde20136d68c8fb67f292dbc9ecadf4febc4",
+              "imagePullPolicy": "IfNotPresent",
+              "args": [
+                "serve"
+              ],
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "seccompProfile": {
+                  "type": "Localhost",
+                  "localhostProfile": "oshal/seccomp-bwrap.json"
+                },
+                "appArmorProfile": {
+                  "type": "Localhost",
+                  "localhostProfile": "oshal-bwrap"
+                },
+                "procMount": "Unmasked"
+              },
+              "envFrom": [
+                {
+                  "configMapRef": {
+                    "name": "oshal-kernel-config"
+                  }
+                },
+                {
+                  "configMapRef": {
+                    "name": "oshal-kernel-endpoints"
+                  }
+                },
+                {
+                  "secretRef": {
+                    "name": "oshal-kernel-secret"
+                  }
+                }
+              ],
+              "env": [
+                {
+                  "name": "OSHAL_ADMIN_TOKEN",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "name": "oshal-kernel-secret",
+                      "key": "OSHAL_ADMIN_TOKEN"
+                    }
+                  }
+                },
+                {
+                  "name": "OSHAL_VAULT_KEY",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "name": "oshal-kernel-secret",
+                      "key": "OSHAL_VAULT_KEY"
+                    }
+                  }
+                },
+                {
+                  "name": "OSHAL_POSTGRES",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "name": "oshal-kernel-secret",
+                      "key": "OSHAL_POSTGRES"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "containerPort": 38788,
+                  "name": "http-cockpit"
+                }
+              ],
+              "startupProbe": {
+                "httpGet": {
+                  "path": "/healthz",
+                  "port": "http-cockpit"
+                },
+                "periodSeconds": 5,
+                "timeoutSeconds": 5,
+                "failureThreshold": 24
+              },
+              "livenessProbe": {
+                "httpGet": {
+                  "path": "/healthz",
+                  "port": "http-cockpit"
+                },
+                "periodSeconds": 15,
+                "timeoutSeconds": 5,
+                "failureThreshold": 3
+              },
+              "readinessProbe": {
+                "httpGet": {
+                  "path": "/readyz",
+                  "port": "http-cockpit"
+                },
+                "periodSeconds": 15,
+                "timeoutSeconds": 5,
+                "failureThreshold": 3
+              },
+              "resources": {
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "limits": {
+                  "cpu": "12",
+                  "memory": "32Gi"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "shared-workspace",
+                  "mountPath": "/app/workspace-shared"
+                },
+                {
+                  "name": "kernel-state",
+                  "mountPath": "/var/lib/oshal"
+                },
+                {
+                  "name": "application-bundle",
+                  "mountPath": "/opt/oshal",
+                  "readOnly": true
+                },
+                {
+                  "name": "scratch",
+                  "mountPath": "/tmp"
+                }
+              ]
+            }
+          ],
+          "volumes": [
+            {
+              "name": "shared-workspace",
+              "persistentVolumeClaim": {
+                "claimName": "oshal-workspace"
+              }
+            },
+            {
+              "name": "kernel-state",
+              "persistentVolumeClaim": {
+                "claimName": "oshal-kernel-state"
+              }
+            },
+            {
+              "name": "application-bundle",
+              "persistentVolumeClaim": {
+                "claimName": "oshal-kernel-applications",
+                "readOnly": true
+              }
+            },
+            {
+              "name": "scratch",
+              "emptyDir": {
+                "sizeLimit": "2Gi"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "name": "oshal-kernel-service",
+      "namespace": "oshal-kernel",
+      "labels": {
+        "app.kubernetes.io/name": "oshal-kernel",
+        "app.kubernetes.io/part-of": "oshal"
+      }
+    },
+    "spec": {
+      "type": "ClusterIP",
+      "selector": {
+        "app.kubernetes.io/name": "oshal-kernel",
+        "app.kubernetes.io/instance": "oshal-kernel-k8s"
+      },
+      "ports": [
+        {
+          "name": "http-cockpit",
+          "port": 38788,
+          "targetPort": "http-cockpit",
+          "protocol": "TCP"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {
+      "name": "code-server",
+      "namespace": "oshal-kernel"
+    },
+    "spec": {
+      "replicas": 1,
+      "strategy": {
+        "type": "Recreate"
+      },
+      "selector": {
+        "matchLabels": {
+          "app.kubernetes.io/name": "code-server"
+        }
+      },
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/name": "code-server"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "hostUsers": false,
+          "securityContext": {
+            "runAsNonRoot": true,
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "fsGroup": 10001,
+            "fsGroupChangePolicy": "OnRootMismatch",
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "containers": [
+            {
+              "name": "code-server",
+              "image": "codercom/code-server@sha256:1c9ad972a78450f430155144110da4c02d3627c72a598e9197e2781fb9f92e28",
+              "imagePullPolicy": "IfNotPresent",
+              "command": [
+                "/usr/bin/code-server"
+              ],
+              "args": [
+                "--auth",
+                "none",
+                "--bind-addr",
+                "127.0.0.1:8080",
+                "--disable-telemetry",
+                "--disable-update-check",
+                "/app/workspace-shared"
+              ],
+              "env": [
+                {
+                  "name": "HOME",
+                  "value": "/tmp/editor-home"
+                }
+              ],
+              "ports": [
+                {
+                  "name": "http-editor",
+                  "containerPort": 8080
+                }
+              ],
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                }
+              },
+              "resources": {
+                "requests": {
+                  "cpu": "50m",
+                  "memory": "128Mi"
+                },
+                "limits": {
+                  "cpu": "1",
+                  "memory": "1Gi"
+                }
+              },
+              "startupProbe": {
+                "exec": {
+                  "command": [
+                    "/usr/bin/curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "2",
+                    "http://127.0.0.1:8080/healthz"
+                  ]
+                },
+                "timeoutSeconds": 3,
+                "periodSeconds": 5,
+                "failureThreshold": 60
+              },
+              "readinessProbe": {
+                "exec": {
+                  "command": [
+                    "/usr/bin/curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "2",
+                    "http://127.0.0.1:8080/healthz"
+                  ]
+                },
+                "timeoutSeconds": 3,
+                "periodSeconds": 5
+              },
+              "livenessProbe": {
+                "exec": {
+                  "command": [
+                    "/usr/bin/curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "2",
+                    "http://127.0.0.1:8080/healthz"
+                  ]
+                },
+                "timeoutSeconds": 3,
+                "periodSeconds": 20
+              },
+              "volumeMounts": [
+                {
+                  "name": "shared-workspace",
+                  "mountPath": "/app/workspace-shared"
+                },
+                {
+                  "name": "scratch",
+                  "mountPath": "/tmp"
+                }
+              ]
+            }
+          ],
+          "volumes": [
+            {
+              "name": "shared-workspace",
+              "persistentVolumeClaim": {
+                "claimName": "oshal-workspace"
+              }
+            },
+            {
+              "name": "scratch",
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "name": "code-server",
+      "namespace": "oshal-kernel"
+    },
+    "spec": {
+      "type": "ClusterIP",
+      "selector": {
+        "app.kubernetes.io/name": "code-server"
+      },
+      "ports": [
+        {
+          "name": "http-editor",
+          "port": 8080,
+          "targetPort": "http-editor"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "name": "code-server-loopback-only",
+      "namespace": "oshal-kernel"
+    },
+    "spec": {
+      "podSelector": {
+        "matchLabels": {
+          "app.kubernetes.io/name": "code-server"
+        }
+      },
+      "policyTypes": [
+        "Ingress"
+      ],
+      "ingress": []
+    }
+  }
+]

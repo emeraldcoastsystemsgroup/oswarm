@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oshal-kernel-endpoints
+  namespace: oshal-kernel
+# Set only independently deployed endpoints. No sidecars or Services are created here.
+# Kernel keys: OSHAL_VLLM_URL, OSHAL_LITELLM_URL, OSHAL_OLLAMA_URL,
+# OSHAL_INFERENCE_LOCAL_ENDPOINTS, OSHAL_TTS_URL, OSHAL_STT_URL,
+# OSHAL_STT_LOCAL_ENDPOINTS. Any OSHAL_WORLD_POSTGRES DSN belongs in the Secret.
+# ADR-207 application engines are declared by the package and prepared on first use.
+# They need no Service or endpoint here. An operator-managed legacy engine may still
+# be pinned through OSHAL_PACKAGE_ENGINES; it overrides the package declaration.
+# Scene Studio keeps its separately configured engine endpoint.
+data: {}

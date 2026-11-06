@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oshal-kernel-state
+  namespace: oshal-kernel
+spec:
+  accessModes: [ReadWriteOncePod]
+  storageClassName: REQUIRED_STATE_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oshal-workspace
+  namespace: oshal-kernel
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  # RWO permits concurrent pods on one node. Use RWX storage for workers on other nodes.
+  accessModes: [ReadWriteOnce]
+  storageClassName: REQUIRED_WORKSPACE_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oshal-kernel-applications
+  namespace: oshal-kernel
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: REQUIRED_BUNDLE_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 20Gi

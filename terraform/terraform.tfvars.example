@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars (git-ignored) and edit. Only kube_context is required.
+kube_context = "my-cluster"
+
+# storage_class      = "standard"
+# state_access_mode  = "ReadWriteOnce"     # when the storage driver is not CSI
+# deployment_profile = "team"
+# public_url         = "https://swarm.example.com"
+# postgres_url       = "postgresql://oshal:<password>@db.example.com:5432/oshal"   # omit for an in-cluster database
+# apparmor           = false               # only for nodes without AppArmor
+# editor             = true

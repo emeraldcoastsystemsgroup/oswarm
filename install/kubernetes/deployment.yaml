@@ -1,0 +1,141 @@
+# oswarm kernel Deployment: one replica, an immutable published image, durable state on a
+# PersistentVolumeClaim, and the sandbox prerequisites the nodes must provide (README.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oshal-kernel-deployment
+  namespace: oshal-kernel
+  labels:
+    app.kubernetes.io/name: oshal-kernel
+    app.kubernetes.io/instance: oshal-kernel-k8s
+spec:
+  replicas: 1
+  # The file journal has one writer; replace the prior pod before starting another.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oshal-kernel
+      app.kubernetes.io/instance: oshal-kernel-k8s
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oshal-kernel
+        app.kubernetes.io/instance: oshal-kernel-k8s
+      annotations:
+        # Record what you deployed: the image digest you pinned below and the digest of the
+        # reviewed application bundle you loaded onto the applications claim.
+        oshal.io/application-bundle-sha256: REQUIRED_REVIEWED_BUNDLE_SHA256
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      # User namespaces and node-installed sandbox policies are required, never bypassed.
+      hostUsers: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        oshal.io/sandbox-ready: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: oshal-kernel
+          # The published oswarm 0.7.1 image, pinned by tag and digest (install/docker/image-release.env).
+          image: ghcr.io/emeraldcoastsystemsgroup/oswarm:0.7.1@sha256:1731a07d146774cb764a839cabf2dde20136d68c8fb67f292dbc9ecadf4febc4
+          imagePullPolicy: IfNotPresent
+          args: [serve]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: Localhost
+              localhostProfile: oshal/seccomp-bwrap.json
+            appArmorProfile:
+              type: Localhost
+              localhostProfile: oshal-bwrap
+            # Bubblewrap mounts a private /proc inside this pod's user namespace.
+            procMount: Unmasked
+          envFrom:
+            - configMapRef:
+                name: oshal-kernel-config
+            - configMapRef:
+                name: oshal-kernel-endpoints
+            - secretRef:
+                name: oshal-kernel-secret
+          # Missing keys stop container creation, with no minted-token or memory-store fallback.
+          env:
+            - name: OSHAL_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: oshal-kernel-secret
+                  key: OSHAL_ADMIN_TOKEN
+            - name: OSHAL_VAULT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oshal-kernel-secret
+                  key: OSHAL_VAULT_KEY
+            - name: OSHAL_POSTGRES
+              valueFrom:
+                secretKeyRef:
+                  name: oshal-kernel-secret
+                  key: OSHAL_POSTGRES
+          ports:
+            - containerPort: 38788
+              name: http-cockpit
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http-cockpit
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-cockpit
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-cockpit
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "12"
+              memory: 32Gi
+          volumeMounts:
+            - name: shared-workspace
+              mountPath: /app/workspace-shared
+            - name: kernel-state
+              mountPath: /var/lib/oshal
+            - name: application-bundle
+              mountPath: /opt/oshal
+              readOnly: true
+            - name: scratch
+              mountPath: /tmp
+      volumes:
+        - name: shared-workspace
+          persistentVolumeClaim:
+            claimName: oshal-workspace
+        - name: kernel-state
+          persistentVolumeClaim:
+            claimName: oshal-kernel-state
+        - name: application-bundle
+          persistentVolumeClaim:
+            claimName: oshal-kernel-applications
+            readOnly: true
+        # Only scratch is ephemeral; journals and application data use the state PVC.
+        - name: scratch
+          emptyDir:
+            sizeLimit: 2Gi

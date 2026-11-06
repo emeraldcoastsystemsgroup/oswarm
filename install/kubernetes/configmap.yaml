@@ -1,0 +1,40 @@
+# oswarm kernel configuration. Every value here is public configuration; secrets go in
+# secret.yaml (or your Secret manager). docs/configuration.md explains each variable.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oshal-kernel-config
+  namespace: oshal-kernel
+data:
+  OSHAL_BIND: "0.0.0.0:38788"
+  # home, team or enterprise.
+  OSHAL_DEPLOYMENT: "enterprise"
+  OSHAL_MOCK_IDENTITY: "false"
+  # Budget reference assumptions for zero-priced calls, not provider prices or billed spend,
+  # expressed as USD per million input/output tokens.
+  OSHAL_COST_ESTIMATE_PER_MTOK_IN: "1.00"
+  OSHAL_COST_ESTIMATE_PER_MTOK_OUT: "3.00"
+  # Package runtimes shipped in the image.
+  OSHAL_PACKAGE_RUNTIME: "/usr/bin/node"
+  OSHAL_BRIDGE_RUNNER: "/app/bridge/runner.js"
+  OSHAL_PLATFORM_DIR: "/app/platform"
+  # Durable state on the oshal-kernel-state claim.
+  OSHAL_PACKAGE_DIR: "/var/lib/oshal/packages"
+  OSHAL_JOURNAL_PATH: "/var/lib/oshal/mesh.jsonl"
+  OSHAL_LEDGER_SPILL_PATH: "/var/lib/oshal/ledger-spill.jsonl"
+  OSHAL_COMPANION_ARTIFACT_DIR: "/var/lib/oshal/artifacts"
+  OSHAL_CAREER_DATA_DIR: "/var/lib/oshal/career"
+  OSHAL_APPLICATION_FILES_DIR: "/var/lib/oshal/application-files"
+  # Application catalogs on the read-only oshal-kernel-applications claim (mounted at /opt/oshal).
+  OSHAL_APPLICATIONS_DIR: "/opt/oshal/applications"
+  OSHAL_APP_PRIVATE_DIR: "/opt/oshal/private-applications"
+  OSHAL_ADDITIONAL_APPLICATIONS_DIRS: "/opt/oshal/additional-applications"
+  # The shared workspace claim and the editor bridge (code-server.yaml).
+  OSHAL_WORKSPACE_ROOT: "/app/workspace-shared"
+  WORKSPACE_ROOT: "/app/workspace-shared"
+  WORKSPACE_DIR: "/app/workspace-shared"
+  SHARED_WORKSPACE_ROOT: "/app/workspace-shared"
+  OSHAL_CODE_SERVER_URL: "http://127.0.0.1:8444"
+  # Default inference: noop answers nothing; configure a provider after signing in.
+  OSHAL_FLEET_PROVIDER: "noop"
+  OSHAL_FLEET_MODEL: "noop-1"
