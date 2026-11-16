@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# CHANGE LOG
+# -----------------------------------------------------------------------------
+# SEQ                 | AUTHOR                      | DESCRIPTION
+# -----------------------------------------------------------------------------
+# 1 | maintainer@emeraldcoastsystemsgroup.com   | Initial implementation
+# 2 | maintainer@emeraldcoastsystemsgroup.com   | Harden AppArmor detection, atomic install state, root/unbound-env handling, and port-matched public URL
+#
 # oswarm: one command installs the dependencies and the product.
 #
 #   curl -fsSL https://oswarm.ai/install.sh | bash
@@ -16,6 +23,7 @@
 #   OSWARM_DIR=~/oswarm           installation directory      OSWARM_ADMIN=admin   administrator
 #   OSWARM_PORT=38788             local port                  OSWARM_ADMIN_PASSWORD=...  use this
 #   OSWARM_IMAGE=...              kernel image reference      instead of generating one
+#   OSWARM_PUBLIC_URL=...         public URL (defaults to http://127.0.0.1:$OSWARM_PORT)
 #   OSWARM_CATALOG_COMMIT=...     application catalog commit  OSWARM_NO_BROWSER=1  do not open
 #   OSWARM_OWNER_APPLICATIONS=engineering (or comma-separated engineering apps): set up only
 #      these applications for the first owner through their current reviewed roles.
@@ -37,15 +45,19 @@ BUNDLE_URL_DEFAULT="https://oswarm.ai/install"
 INSTALLER_URL_DEFAULT="https://oswarm.ai/install.sh"
 BUNDLE_FILES="compose.yaml seccomp-bwrap.json env.example image-release.env image-loader.sh"
 
+HOME="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || echo /root)}"
+CURRENT_USER="${USER:-$(id -un 2>/dev/null || echo root)}"
 DIR="${OSWARM_DIR:-$HOME/oswarm}"; ADMIN="${OSWARM_ADMIN:-admin}"; PORT="${OSWARM_PORT:-38788}"
 IMAGE="${OSWARM_IMAGE:-$IMAGE_DEFAULT}"; CATALOG_COMMIT="${OSWARM_CATALOG_COMMIT:-$CATALOG_COMMIT_DEFAULT}"
 BUNDLE_URL="${OSWARM_BUNDLE_URL:-$BUNDLE_URL_DEFAULT}"; INSTALLER_URL="${OSWARM_INSTALLER_URL:-$INSTALLER_URL_DEFAULT}"
 OWNER_APPS="${OSWARM_OWNER_APPLICATIONS:-}"; INITIAL_OWNER_PASSWORD=""; INITIAL_OWNER_INITIALIZED=0; CREDENTIALS_SHOWN=0
 PROJECT="${OSWARM_PROJECT:-oswarm}"; DOCKER="docker"; PURGE=0; ACTION="install"; GENERATED_PASSWORD=""; IMAGE_SET="${OSWARM_IMAGE:+1}"
+APPARMOR_PROFILE_DEFAULT="oshal-bwrap"; BUNDLE_STAGE=""
 OS="$(uname -s)"; ARCH="$(uname -m)"
 
 say() { printf '\n== %s\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
+cleanup_bundle_stage() { [ -n "${BUNDLE_STAGE:-}" ] && rm -rf "$BUNDLE_STAGE" || true; BUNDLE_STAGE=""; }
 show_initial_credentials() {
   if [ "${INITIAL_OWNER_INITIALIZED:-0}" = 1 ] && [ -n "${GENERATED_PASSWORD:-}" ] && [ "${CREDENTIALS_SHOWN:-0}" = 0 ]; then
     printf '\nAdministrator:   %s\nPassword:        %s\n' "$ADMIN" "$GENERATED_PASSWORD"
@@ -54,29 +66,47 @@ show_initial_credentials() {
   fi
 }
 installation_error() {
+  cleanup_bundle_stage
   printf '\noswarm: failed at line %s: %s\n' "$1" "$2" >&2
   show_initial_credentials
 }
-die() { printf '\noswarm: %s\n' "$*" >&2; show_initial_credentials; exit 1; }
-compose() { (cd "$DIR" && $DOCKER compose "$@"); }
+die() { trap - ERR; cleanup_bundle_stage; printf '\noswarm: %s\n' "$*" >&2; show_initial_credentials; exit 1; }
+compose() { $DOCKER compose --project-directory "$DIR" -f "$DIR/compose.yaml" "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif have sudo; then sudo "$@"
+  else die "root privileges or sudo are required to run: $*"
+  fi
+}
+
+show_help() {
+  [ -n "${BASH_SOURCE[0]:-}" ] && sed -n '9,36p' "${BASH_SOURCE[0]}"
+}
+
+ensure_tools() {
+  local tool
+  for tool in curl tar gzip; do
+    have "$tool" || die "$tool is required to install oswarm"
+  done
+}
 
 parse_arguments() {
   while [ $# -gt 0 ]; do
     case "$1" in
       install|prepare|status|start|stop|restart|logs|upgrade|uninstall) ACTION="$1"; shift ;;
-      --dir) DIR="$2"; shift 2 ;;
-      --admin) ADMIN="$2"; shift 2 ;;
-      --port) PORT="$2"; shift 2 ;;
-      --image) IMAGE="$2"; IMAGE_SET=1; shift 2 ;;
-      --owner-apps) OWNER_APPS="$2"; shift 2 ;;
+      --dir) [ $# -ge 2 ] || die "--dir requires a value"; DIR="$2"; shift 2 ;;
+      --admin) [ $# -ge 2 ] || die "--admin requires a value"; ADMIN="$2"; shift 2 ;;
+      --port) [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; shift 2 ;;
+      --image) [ $# -ge 2 ] || die "--image requires a value"; IMAGE="$2"; IMAGE_SET=1; shift 2 ;;
+      --owner-apps) [ $# -ge 2 ] || die "--owner-apps requires a value"; OWNER_APPS="$2"; shift 2 ;;
       --purge) PURGE=1; shift ;;
-      -h|--help) [ -n "${BASH_SOURCE[0]:-}" ] && sed -n '2,27p' "${BASH_SOURCE[0]}"; exit 0 ;;
+      -h|--help) show_help; exit 0 ;;
       *) die "unknown argument '$1' (see --help)" ;;
     esac
   done
   [[ "$ADMIN" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "the administrator name must be 1-64 letters, digits, dot, underscore or dash"
-  [[ "$PORT" =~ ^[0-9]{2,5}$ ]] || die "the port must be a number"
+  [[ "$PORT" =~ ^[0-9]{2,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "the port must be between 1 and 65535"
   [[ "$CATALOG_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "OSWARM_CATALOG_COMMIT must be a full 40-character commit"
   if [ -n "$OWNER_APPS" ]; then
     case ",$OWNER_APPS," in *,,*) die "owner-apps contains an empty application" ;; esac
@@ -101,14 +131,16 @@ wait_docker() {
 }
 
 install_docker_linux() {
-  say "installing Docker Engine (Docker's own install script; sudo will ask for your password)"
+  say "installing Docker Engine (Docker's own install script)"
   have curl || die "curl is required to download Docker's install script"
   local script; script="$(mktemp)"
   curl -fsSL https://get.docker.com -o "$script"
-  sudo sh "$script"; rm -f "$script"
-  if have systemctl; then sudo systemctl enable --now docker >/dev/null 2>&1 || true; fi
-  sudo usermod -aG docker "$USER" 2>/dev/null || true
-  note "your account was added to the docker group; it applies to new logins. This run uses sudo."
+  as_root sh "$script"; rm -f "$script"
+  if have systemctl; then as_root systemctl enable --now docker >/dev/null 2>&1 || true; fi
+  if [ "$(id -u)" -ne 0 ] && [ -n "$CURRENT_USER" ]; then
+    as_root usermod -aG docker "$CURRENT_USER" 2>/dev/null || true
+    note "your account ($CURRENT_USER) was added to the docker group; it applies to new logins. This run uses sudo."
+  fi
 }
 
 install_docker_macos() {
@@ -122,7 +154,7 @@ install_docker_macos() {
     note "downloading $url"
     curl -fL --progress-bar "$url" -o "$dmg"
     hdiutil attach -nobrowse -quiet "$dmg"
-    sudo cp -R /Volumes/Docker/Docker.app /Applications/
+    as_root cp -R /Volumes/Docker/Docker.app /Applications/
     hdiutil detach -quiet /Volumes/Docker; rm -f "$dmg"
   fi
   open -a Docker
@@ -136,12 +168,17 @@ ensure_docker() {
   fi
   if ! docker_works; then
     if [ "$OS" = Linux ]; then
-      # Either this account cannot reach the socket yet (new docker group) or the engine is stopped.
-      note "Docker is installed but not reachable as $USER; trying with sudo"
-      if sudo docker info >/dev/null 2>&1; then DOCKER="sudo docker"
+      if [ "$(id -u)" -eq 0 ]; then
+        have systemctl && systemctl start docker >/dev/null 2>&1 || true
+        wait_docker
       else
-        have systemctl && sudo systemctl start docker >/dev/null 2>&1 || true
-        DOCKER="sudo docker"; wait_docker
+        note "Docker is installed but not reachable as $CURRENT_USER; trying with sudo"
+        have sudo || die "Docker is not reachable as $CURRENT_USER and sudo is not installed"
+        if sudo docker info >/dev/null 2>&1; then DOCKER="sudo docker"
+        else
+          have systemctl && sudo systemctl start docker >/dev/null 2>&1 || true
+          DOCKER="sudo docker"; wait_docker
+        fi
       fi
     else
       open -a Docker 2>/dev/null || die "Docker Desktop is installed but not running and could not be started"
@@ -172,22 +209,37 @@ policy_body() { grep -v -E '^[[:space:]]*(#|$)' "$1"; }
 ensure_sandbox_policy() {
   [ "$OS" = Linux ] || return 0
   say "checking the application sandbox policy"
-  if [ ! -d /sys/module/apparmor ] || ! have apparmor_parser; then
+  local module_dir="${OSWARM_APPARMOR_MODULE_DIR:-/sys/module/apparmor}"
+  local securityfs_dir="${OSWARM_APPARMOR_SECURITYFS_DIR:-/sys/kernel/security/apparmor}"
+  local destination="${OSWARM_APPARMOR_DEST:-/etc/apparmor.d/oshal-bwrap}"
+  if [ ! -d "$module_dir" ] || [ "$(cat "$module_dir/parameters/enabled" 2>/dev/null || true)" != Y ]; then
     note "this host does not use AppArmor; nothing to install"; return 0
   fi
-  local destination=/etc/apparmor.d/oshal-bwrap scratch; scratch="$(mktemp)"
+  if [ ! -d "$securityfs_dir" ] || ! have apparmor_parser; then
+    APPARMOR_PROFILE_DEFAULT="unconfined"
+    note "AppArmor policy loading is unavailable in this environment; using apparmor=unconfined"
+    return 0
+  fi
+  local scratch; scratch="$(mktemp)"
   apparmor_profile > "$scratch"
   if [ -e "$destination" ]; then
-    # Compare the policy, not its comments. A profile of this name is what the kernel container
-    # needs; one that differs was installed deliberately by something else and is left alone.
-    if [ "$(policy_body "$scratch")" = "$(policy_body "$destination")" ]; then note "the oshal-bwrap profile is already installed"
-    else note "an oshal-bwrap profile is already installed with a different body; keeping it"; fi
+    if [ "$(policy_body "$scratch")" = "$(policy_body "$destination")" ]; then
+      if [ -r "$securityfs_dir/profiles" ] && ! grep -Eq '^oshal-bwrap([[:space:]]|$)' "$securityfs_dir/profiles" 2>/dev/null; then
+        as_root apparmor_parser -r -K "$destination"
+      fi
+      note "the oshal-bwrap profile is already installed"
+    else
+      note "an oshal-bwrap profile is already installed with a different body; keeping it"
+    fi
     rm -f "$scratch"; return 0
   fi
-  note "installing one AppArmor profile, $destination (sudo will ask for your password)"
-  sudo apparmor_parser -Q -K "$scratch"
-  sudo install -m 0644 "$scratch" "$destination"
-  sudo apparmor_parser -r -K "$destination"
+  note "installing one AppArmor profile, $destination"
+  if ! (as_root apparmor_parser -Q -K "$scratch" && as_root apparmor_parser -r -K "$scratch"); then
+    rm -f "$scratch"
+    die "could not load the AppArmor profile $destination"
+  fi
+  as_root mkdir -p "$(dirname "$destination")"
+  as_root install -m 0644 "$scratch" "$destination"
   rm -f "$scratch"
   note "installed; global AppArmor restrictions unchanged"
 }
@@ -195,18 +247,25 @@ ensure_sandbox_policy() {
 # ----- 3. The product -------------------------------------------------------------------------
 
 fetch_bundle() {
-  local name source here=""
+  local target_dir="${1:-$DIR}" name source here=""
   [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/docker/compose.yaml" ] && here="$(cd "$(dirname "${BASH_SOURCE[0]}")/docker" && pwd)"
   for name in $BUNDLE_FILES; do
     if [ -n "$here" ]; then
       source="$here/$name"; [ "$name" = env.example ] && source="$here/.env.example"
-      cp "$source" "$DIR/$name"
+      cp "$source" "$target_dir/$name"
     else
-      curl -fsSL "$BUNDLE_URL/$name" -o "$DIR/$name" || die "could not download $BUNDLE_URL/$name"
+      curl -fsSL "$BUNDLE_URL/$name" -o "$target_dir/$name" || die "could not download $BUNDLE_URL/$name"
     fi
   done
-  if [ -n "$here" ]; then cp "${BASH_SOURCE[0]}" "$DIR/oswarm.sh"; else curl -fsSL "$INSTALLER_URL" -o "$DIR/oswarm.sh" || die "could not download $INSTALLER_URL"; fi
-  chmod 0755 "$DIR/oswarm.sh"; chmod 0644 "$DIR/compose.yaml" "$DIR/seccomp-bwrap.json"
+  if [ -n "$here" ]; then cp "${BASH_SOURCE[0]}" "$target_dir/oswarm.sh"; else curl -fsSL "$INSTALLER_URL" -o "$target_dir/oswarm.sh" || die "could not download $INSTALLER_URL"; fi
+  chmod 0755 "$target_dir/oswarm.sh"; chmod 0644 "$target_dir/compose.yaml" "$target_dir/seccomp-bwrap.json"
+}
+
+verify_release_bundle() {
+  local DIR="$1"
+  source "$DIR/image-loader.sh"
+  [ "$(release_value IMAGE)" = "$IMAGE_DEFAULT" ] || die "this installer and its image release lock name different images; download the current installer"
+  ensure_release_image
 }
 
 random_hex() {
@@ -234,11 +293,22 @@ host_limits() {
 }
 
 write_configuration() {
+  local staged_bundle="${1:-}" public_url="${OSWARM_PUBLIC_URL:-http://127.0.0.1:$PORT}"
+  local apparmor_profile="${OSWARM_APPARMOR_PROFILE:-$APPARMOR_PROFILE_DEFAULT}"
   say "creating $DIR"
   umask 077
   mkdir -p "$DIR/applications"
-  fetch_bundle
-  { cat "$DIR/env.example"; echo; echo "# written by the installer"; echo "OSWARM_PORT=$PORT"; echo "OSWARM_IMAGE=$IMAGE"; echo "OSWARM_PROJECT=$PROJECT"; } > "$DIR/.env"
+  if [ -n "$staged_bundle" ]; then cp -Rp "$staged_bundle"/. "$DIR"/; else fetch_bundle "$DIR"; fi
+  {
+    cat "$DIR/env.example"
+    echo
+    echo "# written by the installer"
+    echo "OSWARM_PORT=$PORT"
+    echo "OSWARM_PUBLIC_URL=$public_url"
+    echo "OSWARM_IMAGE=$IMAGE"
+    echo "OSWARM_PROJECT=$PROJECT"
+    echo "OSWARM_APPARMOR_PROFILE=$apparmor_profile"
+  } > "$DIR/.env"
   host_limits >> "$DIR/.env"
   rm -f "$DIR/env.example"
   local dbpass; dbpass="$(random_hex)"
@@ -270,19 +340,14 @@ install_product() {
   if [ -n "${OSWARM_ADMIN_PASSWORD:-}" ]; then password="$OSWARM_ADMIN_PASSWORD"; else password="$(random_password)"; GENERATED_PASSWORD="$password"; fi
   local bytes; bytes="$(printf '%s' "$password" | wc -c | tr -d ' ')"
   [ "$bytes" -ge 12 ] && [ "$bytes" -le 1024 ] || die "OSWARM_ADMIN_PASSWORD must be 12 to 1024 UTF-8 bytes"
-  if [ -z "$IMAGE_SET" ]; then
-    # Pull and verify before writing any installation state. A failed download
-    # can be retried with the same command without creating a half-installation.
-    (
-      DIR="$(mktemp -d "${TMPDIR:-/tmp}/oswarm-server.XXXXXX")"
-      trap 'rm -rf "$DIR"' EXIT
-      fetch_bundle
-      source "$DIR/image-loader.sh"
-      [ "$(release_value IMAGE)" = "$IMAGE_DEFAULT" ] || die "this installer and its image release lock name different images; download the current installer"
-      ensure_release_image
-    )
-  fi
-  write_configuration
+  # Stage the bundle and verify any pinned release image before creating $DIR, so a failed
+  # download leaves nothing behind and can be retried cleanly with the same command.
+  BUNDLE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/oswarm-bundle.XXXXXX")"
+  fetch_bundle "$BUNDLE_STAGE"
+  if [ -z "$IMAGE_SET" ]; then verify_release_bundle "$BUNDLE_STAGE"; fi
+  write_configuration "$BUNDLE_STAGE"
+  cleanup_bundle_stage
+  : > "$DIR/.installing"; chmod 0600 "$DIR/.installing"
   say "downloading the kernel image and PostgreSQL"
   if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then note "$IMAGE is already present"; compose pull --quiet postgres; else compose pull --quiet; fi
   say "starting PostgreSQL"
@@ -294,6 +359,9 @@ install_product() {
   INITIAL_OWNER_INITIALIZED=1
   INITIAL_OWNER_PASSWORD="$password"
   password=""
+  printf '{"version":1,"admin":%s}\n' "$(json_string "$ADMIN")" > "$DIR/installation.json"
+  chmod 0600 "$DIR/installation.json"
+  rm -f "$DIR/.installing"
   say "starting the kernel"
   compose up -d kernel
   wait_ready
@@ -315,7 +383,7 @@ stage_catalog() {
   local stage; stage="$(mktemp -d "$DIR/.catalog-stage.XXXXXX")"
   curl -fsSL "${OSWARM_CATALOG_URL:-https://codeload.github.com/emeraldcoastsystemsgroup/oshal-apps/tar.gz/$CATALOG_COMMIT}" -o "$stage/catalog.tar.gz" \
     || { rm -rf "$stage"; die "could not download the catalog at $CATALOG_COMMIT"; }
-  if tar -tzvf "$stage/catalog.tar.gz" | awk '{print substr($1,1,1)}' | grep -q '^l'; then rm -rf "$stage"; die "that catalog revision contains links; refusing"; fi
+  if tar -tzvf "$stage/catalog.tar.gz" | awk '{print substr($1,1,1)}' | grep -qE '^[lh]'; then rm -rf "$stage"; die "that catalog revision contains links; refusing"; fi
   mkdir "$stage/source"
   tar -xzf "$stage/catalog.tar.gz" -C "$stage/source" --strip-components=1
   printf '{"version":1,"origin":"%s","reference":"%s","commit":"%s","provenance":"reconstructed-from-origin"}\n' "$CATALOG_REPO" "$CATALOG_COMMIT" "$CATALOG_COMMIT" > "$stage/source/native-source-origin.json"
@@ -363,9 +431,16 @@ provision_initial_owner() {
 }
 
 do_install() {
+  ensure_tools
   ensure_docker
   ensure_sandbox_policy
+  if [ -f "$DIR/.installing" ]; then
+    note "cleaning up an incomplete earlier installation in $DIR"
+    [ -f "$DIR/compose.yaml" ] && compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+    rm -rf "$DIR"
+  fi
   if [ -f "$DIR/runtime.env" ]; then
+    PORT="$(grep '^OSWARM_PORT=' "$DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"; PORT="${PORT:-38788}"
     say "$DIR is already an installation; starting it (passwords and data are never reset)"
     compose up -d; wait_ready
   else
@@ -401,7 +476,7 @@ day_two() {
     logs) compose logs --tail 200 kernel ;;
     upgrade)
       if [ -z "$IMAGE_SET" ]; then
-        fetch_bundle
+        fetch_bundle "$DIR"
         source "$DIR/image-loader.sh"; ensure_release_image; IMAGE_SET=1
       fi
       if [ -n "$IMAGE_SET" ]; then

@@ -128,10 +128,11 @@ For release validation (Docker, Python 3, Node and Playwright required), `script
 
 ## Requirements
 
-A machine with 2 CPUs and 4 GB of memory free for the two containers: Linux with systemd
-(Ubuntu 22.04 or later, Debian 12, Fedora), macOS 12 or later, or Windows 10/11 with
-virtualization enabled. The installer brings Docker (Engine 24+ with Compose v2, or Docker
-Desktop) and, on Linux hosts with AppArmor, the `oshal-bwrap` profile.
+A machine with at least 2 CPUs, 8 GB of system memory (4 GB free for the two containers), and
+10 GB of free disk: Linux with systemd (Ubuntu 22.04 or later, Debian 12, Fedora), macOS 12 or
+later, or Windows 10/11 with virtualization enabled. The installer brings Docker (Engine 24+
+with Compose v2, or Docker Desktop) and, on Linux hosts with active AppArmor, the `oshal-bwrap`
+profile.
 
 Engineering engines require additional memory while running and about 6 GB of disk for the five engine images. On an ADR-207 kernel they download on first use, so applications that are never used do not consume that space.
 
