@@ -5,6 +5,7 @@ SEQ                 | AUTHOR                      | DESCRIPTION
 -----------------------------------------------------------------------------
 1 | maintainer@emeraldcoastsystemsgroup.com   | Initial implementation
 2 | maintainer@emeraldcoastsystemsgroup.com   | Harden piped strict-mode defaults, atomic install state, credential recovery, upgrade .env rewrite, public URL port sync, and owner-apps parity
+3 | maintainer@emeraldcoastsystemsgroup.com   | Validate OSWARM_ENGINE_MIRROR upfront, write tokenized .installing before config files, refuse colliding Compose projects, and self-root copied oswarm.ps1
 
 oswarm: one command installs the dependencies and the product, on Windows.
 
@@ -22,7 +23,8 @@ What it does, in order, and skips whatever is already in place:
 Settings are environment variables (the script is usually piped, so there is no prompt):
   OSWARM_DIR=%USERPROFILE%\oswarm   installation directory     OSWARM_ADMIN=admin
   OSWARM_PORT=38788                 local port                 OSWARM_ADMIN_PASSWORD=...
-  OSWARM_IMAGE=...                  kernel image reference     OSWARM_NO_BROWSER=1
+  OSWARM_PROJECT=oswarm             Docker Compose project     OSWARM_NO_BROWSER=1
+  OSWARM_IMAGE=...                  kernel image reference
   OSWARM_PUBLIC_URL=...             public URL (defaults to http://127.0.0.1:$OSWARM_PORT)
   OSWARM_CATALOG_COMMIT=...         application catalog commit
   OSWARM_OWNER_APPLICATIONS=...     engineering owner setup on first install
@@ -37,9 +39,10 @@ was never done; it never resets a password and never deletes data.
 [CmdletBinding()]
 param(
     [ValidateSet('install','prepare','status','start','stop','restart','logs','upgrade','uninstall')][string]$Action = 'install',
-    [string]$Dir = $(if ($env:OSWARM_DIR) { $env:OSWARM_DIR } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE 'oswarm' } elseif (Test-Path Variable:\HOME) { Join-Path $HOME 'oswarm' } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) 'oswarm' }),
+    [string]$Dir = $(if ($env:OSWARM_DIR) { $env:OSWARM_DIR } elseif ((Test-Path Variable:\PSCommandPath) -and $PSCommandPath -and ([IO.Path]::GetFileName($PSCommandPath) -ieq 'oswarm.ps1')) { [IO.Path]::GetDirectoryName($PSCommandPath) } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE 'oswarm' } elseif (Test-Path Variable:\HOME) { Join-Path $HOME 'oswarm' } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) 'oswarm' }),
     [string]$Admin = $(if ($env:OSWARM_ADMIN) { $env:OSWARM_ADMIN } else { 'admin' }),
     [int]$Port = $(if ($env:OSWARM_PORT) { [int]$env:OSWARM_PORT } else { 38788 }),
+    [string]$Project = $(if ($env:OSWARM_PROJECT) { $env:OSWARM_PROJECT } else { 'oswarm' }),
     [string]$Image = $(if ($env:OSWARM_IMAGE) { $env:OSWARM_IMAGE } else { '' }),
     [string]$OwnerApps = $(if ($env:OSWARM_OWNER_APPLICATIONS) { $env:OSWARM_OWNER_APPLICATIONS } else { '' }),
     [switch]$Purge
@@ -53,8 +56,10 @@ $CatalogRepo = 'https://github.com/emeraldcoastsystemsgroup/oshal-apps'
 $CatalogCommit = if ($env:OSWARM_CATALOG_COMMIT) { $env:OSWARM_CATALOG_COMMIT } else { '3a0e0764f143472ac3f181bd0f98127cc23dd90b' }
 $BundleUrl = if ($env:OSWARM_BUNDLE_URL) { $env:OSWARM_BUNDLE_URL } else { 'https://oswarm.ai/install' }
 $InstallerUrl = if ($env:OSWARM_INSTALLER_URL) { $env:OSWARM_INSTALLER_URL } else { 'https://oswarm.ai/install.ps1' }
-$Project = if ($env:OSWARM_PROJECT) { $env:OSWARM_PROJECT } else { 'oswarm' }
+$InstallingToken = 'oswarm-incomplete-install-v1'
 $ScriptRoot = if (Test-Path Variable:\PSScriptRoot) { $PSScriptRoot } else { '' }
+$PortSet = $PSBoundParameters.ContainsKey('Port') -or [bool]$env:OSWARM_PORT
+$ProjectSet = $PSBoundParameters.ContainsKey('Project') -or [bool]$env:OSWARM_PROJECT
 $ImageSet = [bool]$Image
 if (-not $Image) { $Image = $ImageDefault }
 $script:GeneratedPassword = ''
@@ -80,17 +85,53 @@ function Invoke-Docker([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { Fail "docker $($Arguments -join ' ') failed: $output" }
     return $output
 }
-function Invoke-Compose([string[]]$Arguments) {
+function Invoke-Compose([string[]]$Arguments, [string]$ProjectName = $Project) {
     $composeFile = Join-Path $Dir 'compose.yaml'
-    & docker compose --project-directory $Dir -f $composeFile @Arguments
-    if ($LASTEXITCODE -ne 0) { Fail "docker compose $($Arguments -join ' ') failed" }
+    $hadPrev = Test-Path Env:\OSWARM_PROJECT
+    $prev = if ($hadPrev) { $env:OSWARM_PROJECT } else { '' }
+    try {
+        $env:OSWARM_PROJECT = $ProjectName
+        & docker compose --project-directory $Dir -f $composeFile @Arguments
+        if ($LASTEXITCODE -ne 0) { Fail "docker compose $($Arguments -join ' ') failed" }
+    } finally {
+        if ($hadPrev) { $env:OSWARM_PROJECT = $prev } else { Remove-Item Env:\OSWARM_PROJECT -ErrorAction SilentlyContinue }
+    }
 }
 function Write-Utf8([string]$Path, [string]$Text) { [IO.File]::WriteAllText($Path, $Text, $Utf8) }
 
+function Get-EnvSetting([string]$Key, [string]$EnvFile = (Join-Path $Dir '.env')) {
+    if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { return '' }
+    $found = Select-String -LiteralPath $EnvFile -Pattern ("^{0}=(.*)$" -f [Regex]::Escape($Key)) -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($found) { return $found.Matches[0].Groups[1].Value.Trim() }
+    return ''
+}
+
+function Read-ExistingEnv {
+    if (-not $PortSet) {
+        $savedPort = Get-EnvSetting 'OSWARM_PORT'
+        if ($savedPort -match '^\d+$') { $script:Port = [int]$savedPort }
+    }
+    if (-not $ProjectSet) {
+        $savedProject = Get-EnvSetting 'OSWARM_PROJECT'
+        if (-not $savedProject) { $savedProject = Get-EnvSetting 'COMPOSE_PROJECT_NAME' }
+        if ($savedProject) { $script:Project = $savedProject }
+    }
+}
+
 function Confirm-Inputs {
     if ($Admin -notmatch '^[A-Za-z0-9._-]{1,64}$') { Fail 'the administrator name must be 1-64 letters, digits, dot, underscore or dash' }
+    if ($Project -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$') { Fail 'the project name must be 1-63 letters, digits, underscore or dash' }
     if ($Port -lt 1 -or $Port -gt 65535) { Fail 'the port must be between 1 and 65535' }
     if ($CatalogCommit -notmatch '^[0-9a-f]{40}$') { Fail 'OSWARM_CATALOG_COMMIT must be a full 40-character commit' }
+    if ($env:OSWARM_ENGINE_MIRROR) {
+        if ($env:OSWARM_ENGINE_MIRROR -match '[\x00-\x1F\x7F]' -or $env:OSWARM_ENGINE_MIRROR -notmatch '^\{.*\}$') {
+            Fail 'OSWARM_ENGINE_MIRROR must be a single-line JSON object'
+        }
+        try {
+            $parsedMirror = $env:OSWARM_ENGINE_MIRROR | ConvertFrom-Json
+            if ($null -eq $parsedMirror -or $parsedMirror -is [array] -or $parsedMirror -is [string] -or $parsedMirror -is [ValueType]) { throw 'not-object' }
+        } catch { Fail 'OSWARM_ENGINE_MIRROR must be a single-line JSON object' }
+    }
     if ($OwnerApps) {
         if ($OwnerApps -match '(^,|,,|,$)') { Fail 'owner-apps contains an empty application' }
         $allowed = @('engineering','design-studio','cad-studio','circuit-lab','embodied','aero-lab','scan-to-print')
@@ -244,12 +285,54 @@ function Get-HostLimits {
     return "OSWARM_KERNEL_CPUS=$cpus`nOSWARM_KERNEL_MEMORY=${memory}m`n"
 }
 
+function Test-RegularFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $item = Get-Item -LiteralPath $Path -Force
+    return -not [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+
+function Test-IncompleteInstall {
+    $marker = Join-Path $Dir '.installing'
+    $composeFile = Join-Path $Dir 'compose.yaml'
+    if (-not (Test-RegularFile $marker) -or -not (Test-RegularFile $composeFile)) { return $false }
+    return ([IO.File]::ReadAllText($marker).Trim() -eq $InstallingToken)
+}
+
+function Remove-IncompleteInstall {
+    Note "cleaning up an incomplete earlier installation in $Dir"
+    $savedProject = Get-EnvSetting 'OSWARM_PROJECT'
+    if (-not $savedProject) { $savedProject = Get-EnvSetting 'COMPOSE_PROJECT_NAME' }
+    if (-not $savedProject) { $savedProject = $Project }
+    $realDir = [IO.Path]::GetFullPath($Dir)
+    $foreignOwner = ''
+    $ids = (& docker ps -a -q --filter "label=com.docker.compose.project=$savedProject" 2>$null | Out-String).Split("`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    foreach ($cid in $ids) {
+        $wdir = (& docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' $cid 2>$null | Out-String).Trim()
+        if ($wdir -and ([IO.Path]::GetFullPath($wdir) -ne $realDir)) { $foreignOwner = $wdir; break }
+    }
+    if (-not $foreignOwner) {
+        try { Invoke-Compose -Arguments @('down','--volumes','--remove-orphans') -ProjectName $savedProject } catch { }
+    }
+    Remove-Item -Recurse -Force $Dir -ErrorAction SilentlyContinue
+}
+
+function Confirm-ProjectFree {
+    $containers = (& docker ps -a -q --filter "label=com.docker.compose.project=$Project" 2>$null | Out-String).Trim()
+    $volumes = (& docker volume ls -q --filter "label=com.docker.compose.project=$Project" 2>$null | Out-String).Trim()
+    if ($containers -or $volumes) {
+        Fail "Docker Compose project '$Project' already has containers or volumes on this machine; set OSWARM_PROJECT (or pass -Project) to a distinct project name for a second installation"
+    }
+}
+
 function Write-Configuration([string]$StagedBundle = '') {
+    Confirm-Inputs
     Say "creating $Dir"
     New-Item -ItemType Directory -Path $Dir | Out-Null
     if ($env:OS -eq 'Windows_NT') { Protect-Directory $Dir }
     New-Item -ItemType Directory -Path (Join-Path $Dir 'applications') | Out-Null
-    if ($env:OS -ne 'Windows_NT') { & chmod 755 $Dir; & chmod 755 (Join-Path $Dir 'applications') }
+    $installingMarker = Join-Path $Dir '.installing'
+    Write-Utf8 $installingMarker "$InstallingToken`n"
+    if ($env:OS -ne 'Windows_NT') { & chmod 600 $installingMarker; & chmod 755 $Dir; & chmod 755 (Join-Path $Dir 'applications') }
     if ($StagedBundle) { Get-ChildItem -Force $StagedBundle | Copy-Item -Destination $Dir -Recurse } else { Get-Bundle $Dir }
     $publicUrl = if ($env:OSWARM_PUBLIC_URL) { $env:OSWARM_PUBLIC_URL } else { "http://127.0.0.1:$Port" }
     $settings = (Get-Content (Join-Path $Dir 'env.example') -Raw) + "`n# written by the installer`nOSWARM_PORT=$Port`nOSWARM_PUBLIC_URL=$publicUrl`nOSWARM_IMAGE=$Image`nOSWARM_PROJECT=$Project`n" + (Get-HostLimits)
@@ -258,10 +341,7 @@ function Write-Configuration([string]$StagedBundle = '') {
     $dbpass = New-Hex
     Write-Utf8 (Join-Path $Dir 'postgres.env') "POSTGRES_USER=postgres`nPOSTGRES_DB=oshal`nPOSTGRES_PASSWORD=$dbpass`n"
     $runtimeText = "OSHAL_ADMIN_SUBJECT=$Admin`nOSHAL_ADMIN_TOKEN=$(New-Hex)`nOSHAL_VAULT_KEY=$(New-Hex)`nOSHAL_POSTGRES=postgresql://postgres:$dbpass@postgres:5432/oshal`n"
-    if ($env:OSWARM_ENGINE_MIRROR) {
-        if ($env:OSWARM_ENGINE_MIRROR -match '[\x00-\x1F\x7F]') { Fail 'engine mirror must be one line of JSON' }
-        $runtimeText += "OSHAL_ENGINE_MIRROR=$($env:OSWARM_ENGINE_MIRROR)`n"
-    }
+    if ($env:OSWARM_ENGINE_MIRROR) { $runtimeText += "OSHAL_ENGINE_MIRROR=$($env:OSWARM_ENGINE_MIRROR)`n" }
     Write-Utf8 (Join-Path $Dir 'runtime.env') $runtimeText
     if ($env:OS -ne 'Windows_NT') { & chmod 600 (Join-Path $Dir '.env') (Join-Path $Dir 'postgres.env') (Join-Path $Dir 'runtime.env') }
 }
@@ -279,6 +359,7 @@ function Test-PortFree { $listener = New-Object Net.Sockets.TcpListener([Net.IPA
 function Install-Product {
     Confirm-Inputs
     if (-not (Test-PortFree)) { Fail "port $Port is already in use on this machine; set OSWARM_PORT to another port" }
+    Confirm-ProjectFree
     $password = if ($env:OSWARM_ADMIN_PASSWORD) { $env:OSWARM_ADMIN_PASSWORD } else { $script:GeneratedPassword = New-Password; $script:GeneratedPassword }
     if ($password -match '[\x00-\x1F\x7F]') { Fail 'the password may not contain control characters' }
     $bytes = [Text.Encoding]::UTF8.GetByteCount($password)
@@ -290,9 +371,6 @@ function Install-Product {
         if (-not $ImageSet) { Initialize-ReleaseImage -LockDirectory $bundleStage }
         Write-Configuration $bundleStage
     } finally { Remove-Item -Recurse -Force $bundleStage -ErrorAction SilentlyContinue }
-    $installingMarker = Join-Path $Dir '.installing'
-    Write-Utf8 $installingMarker ''
-    if ($env:OS -ne 'Windows_NT') { & chmod 600 $installingMarker }
     Say 'downloading the kernel image and PostgreSQL'
     & docker image inspect $Image *> $null
     if ($LASTEXITCODE -eq 0) { Note "$Image is already present"; Invoke-Compose @('pull','--quiet','postgres') } else { Invoke-Compose @('pull','--quiet') }
@@ -301,18 +379,24 @@ function Install-Product {
     Say "setting the administrator's first password"
     $json = @{ username = $Admin; password = $password } | ConvertTo-Json -Compress
     $previous = [Console]::OutputEncoding; $previousOut = $OutputEncoding
+    $hadPrevProj = Test-Path Env:\OSWARM_PROJECT
+    $prevProj = if ($hadPrevProj) { $env:OSWARM_PROJECT } else { '' }
     try {
         [Console]::OutputEncoding = $Utf8; $OutputEncoding = $Utf8
+        $env:OSWARM_PROJECT = $Project
         $composeFile = Join-Path $Dir 'compose.yaml'
         $json | & docker compose --project-directory $Dir -f $composeFile run --rm -T --no-deps kernel init-password
         if ($LASTEXITCODE -ne 0) { Fail 'administrator initialization failed; the installation directory was kept for inspection' }
-    } finally { [Console]::OutputEncoding = $previous; $OutputEncoding = $previousOut; $json = $null }
+    } finally {
+        [Console]::OutputEncoding = $previous; $OutputEncoding = $previousOut; $json = $null
+        if ($hadPrevProj) { $env:OSWARM_PROJECT = $prevProj } else { Remove-Item Env:\OSWARM_PROJECT -ErrorAction SilentlyContinue }
+    }
     $script:InitialOwnerInitialized = $true
     $script:InitialOwnerPassword = $password
     $password = $null
     Write-Utf8 (Join-Path $Dir 'installation.json') ((@{ version = 1; admin = $Admin } | ConvertTo-Json -Compress) + "`n")
     if ($env:OS -ne 'Windows_NT') { & chmod 600 (Join-Path $Dir 'installation.json') }
-    Remove-Item -Force $installingMarker -ErrorAction SilentlyContinue
+    Remove-Item -Force (Join-Path $Dir '.installing') -ErrorAction SilentlyContinue
     Say 'starting the kernel'
     Invoke-Compose @('up','-d','kernel')
     Wait-Ready
@@ -359,11 +443,17 @@ function Set-InitialOwner {
     $helper = Get-Content (Join-Path $Dir 'owner-applications.cjs') -Raw
     $composeFile = Join-Path $Dir 'compose.yaml'
     $previous = [Console]::OutputEncoding; $previousOut = $OutputEncoding
+    $hadPrevProj = Test-Path Env:\OSWARM_PROJECT
+    $prevProj = if ($hadPrevProj) { $env:OSWARM_PROJECT } else { '' }
     try {
         [Console]::OutputEncoding = $Utf8; $OutputEncoding = $Utf8
+        $env:OSWARM_PROJECT = $Project
         $payload | & docker compose --project-directory $Dir -f $composeFile exec -T kernel node -e "$helper; main().catch(e => { console.error(e.message); process.exitCode = 1; });"
         if ($LASTEXITCODE -ne 0) { Fail 'selected owner setup failed; inspect the assignment reason, then use the App Loader (passwords were not reset)' }
-    } finally { [Console]::OutputEncoding = $previous; $OutputEncoding = $previousOut; $payload = $null; $script:InitialOwnerPassword = '' }
+    } finally {
+        [Console]::OutputEncoding = $previous; $OutputEncoding = $previousOut; $payload = $null; $script:InitialOwnerPassword = ''
+        if ($hadPrevProj) { $env:OSWARM_PROJECT = $prevProj } else { Remove-Item Env:\OSWARM_PROJECT -ErrorAction SilentlyContinue }
+    }
 }
 
 function Show-Summary {
@@ -385,18 +475,12 @@ function Invoke-Install {
     try {
         Confirm-Inputs
         Confirm-Docker
-        $installingMarker = Join-Path $Dir '.installing'
-        if (Test-Path $installingMarker) {
-            Note "cleaning up an incomplete earlier installation in $Dir"
-            if (Test-Path (Join-Path $Dir 'compose.yaml')) { try { Invoke-Compose @('down','--volumes','--remove-orphans') } catch { } }
-            Remove-Item -Recurse -Force $Dir -ErrorAction SilentlyContinue
-        }
-        if (Test-Path (Join-Path $Dir 'runtime.env')) {
-            $saved = Select-String -Path (Join-Path $Dir '.env') -Pattern '^OSWARM_PORT=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
-            if ($saved) { $script:Port = [int]$saved.Matches[0].Groups[1].Value }
+        if (Test-IncompleteInstall) { Remove-IncompleteInstall }
+        if ((Test-Path -LiteralPath (Join-Path $Dir 'runtime.env') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $Dir '.installing'))) {
+            Read-ExistingEnv
             Say "$Dir is already an installation; starting it (passwords and data are never reset)"
             Invoke-Compose @('up','-d'); Wait-Ready
-        } elseif (Test-Path $Dir) { Fail "$Dir exists but is not an oswarm installation; choose another OSWARM_DIR" }
+        } elseif (Test-Path -LiteralPath $Dir) { Fail "$Dir exists but is not an oswarm installation; choose another OSWARM_DIR" }
         else { Install-Product }
         Add-Catalog
         Set-InitialOwner
@@ -408,10 +492,9 @@ function Invoke-Install {
 }
 
 function Invoke-DayTwo {
-    if (-not (Test-Path (Join-Path $Dir 'compose.yaml'))) { Fail "$Dir is not an oswarm installation; run the installer first" }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'compose.yaml') -PathType Leaf)) { Fail "$Dir is not an oswarm installation; run the installer first" }
     if (-not (Test-Docker)) { Confirm-Docker | Out-Null }
-    $saved = Select-String -Path (Join-Path $Dir '.env') -Pattern '^OSWARM_PORT=(\d+)' | Select-Object -Last 1
-    if ($saved) { $script:Port = [int]$saved.Matches[0].Groups[1].Value }
+    Read-ExistingEnv
     switch ($Action) {
         'status' { Invoke-Compose @('ps'); try { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/readyz" -TimeoutSec 2 | ConvertTo-Json -Compress } catch { Write-Host 'not ready' } }
         'start' { Invoke-Compose @('up','-d'); Wait-Ready; Write-Host "ready: http://127.0.0.1:$Port/login" }
@@ -425,8 +508,7 @@ function Invoke-DayTwo {
                 $kept = @((Get-Content $envPath) | Where-Object { $_ -notmatch '^OSWARM_IMAGE=' })
                 Write-Utf8 $envPath ((@($kept + "OSWARM_IMAGE=$Image") -join "`n") + "`n")
             }
-            $memSetting = Select-String -Path $envPath -Pattern '^OSWARM_KERNEL_MEMORY=(.*)$' | Select-Object -Last 1
-            if ($memSetting -and $memSetting.Matches[0].Groups[1].Value.Trim() -eq '2g') {
+            if ((Get-EnvSetting 'OSWARM_KERNEL_MEMORY' $envPath) -eq '2g') {
                 Write-Utf8 $envPath ((Get-Content $envPath -Raw) + (Get-HostLimits))
             }
             if ($env:OS -ne 'Windows_NT') { & chmod 600 $envPath }

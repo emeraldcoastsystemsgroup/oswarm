@@ -6,6 +6,7 @@
  * -----------------------------------------------------------------------------
  * 1 | maintainer@emeraldcoastsystemsgroup.com   | Initial implementation
  * 2 | maintainer@emeraldcoastsystemsgroup.com   | Forward prepare action and --owner-apps option to Windows PowerShell installer
+ * 3 | maintainer@emeraldcoastsystemsgroup.com   | Forward --project option to Windows PowerShell installer
  */
 'use strict';
 const path=require('node:path');
@@ -22,9 +23,9 @@ function translateWindowsArgs(argv) {
   for(let i=0;i<argv.length;i++) {
     const value=argv[i];
     if(['install','prepare','status','start','stop','restart','logs','upgrade','uninstall'].includes(value))args.push('-Action',value);
-    else if(['--dir','--admin','--port','--image','--owner-apps'].includes(value)) {
+    else if(['--dir','--admin','--port','--project','--image','--owner-apps'].includes(value)) {
       if(!argv[i+1])throw new Error(`Supply a value for ${value}.`);
-      const param=value==='--owner-apps'?'-OwnerApps':'-'+value.slice(2);
+      const param=value==='--owner-apps'?'-OwnerApps':value==='--project'?'-Project':'-'+value.slice(2);
       args.push(param,argv[++i]);
     } else if(value==='--purge')args.push('-Purge');
     else throw new Error(`Unknown installer argument: ${value}`);
