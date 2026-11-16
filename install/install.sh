@@ -6,6 +6,7 @@
 # 1 | maintainer@emeraldcoastsystemsgroup.com   | Initial implementation
 # 2 | maintainer@emeraldcoastsystemsgroup.com   | Harden AppArmor detection, atomic install state, root/unbound-env handling, and port-matched public URL
 # 3 | maintainer@emeraldcoastsystemsgroup.com   | Check AppArmor policy/profiles for non-root re-runs, write tokenized .installing before config files, refuse colliding Compose projects, and self-root copied oswarm.sh
+# 4 | maintainer@emeraldcoastsystemsgroup.com   | Normalize OSWARM_PROJECT / --project to lowercase so Compose project checks match capitalised inputs
 #
 # oswarm: one command installs the dependencies and the product.
 #
@@ -48,6 +49,10 @@ INSTALLER_URL_DEFAULT="https://oswarm.ai/install.sh"
 BUNDLE_FILES="compose.yaml seccomp-bwrap.json env.example image-release.env image-loader.sh"
 INSTALLING_TOKEN="oswarm-incomplete-install-v1"
 
+normalize_project() {
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
 HOME="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || echo /root)}"
 CURRENT_USER="${USER:-$(id -un 2>/dev/null || echo root)}"
 SELF_DIR=""
@@ -56,7 +61,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ "$(basename "${BASH_SOURCE[0]}")" = "oswarm
 fi
 DIR="${OSWARM_DIR:-${SELF_DIR:-$HOME/oswarm}}"
 ADMIN="${OSWARM_ADMIN:-admin}"; PORT="${OSWARM_PORT:-38788}"; PORT_SET="${OSWARM_PORT:+1}"
-PROJECT="${OSWARM_PROJECT:-oswarm}"; PROJECT_SET="${OSWARM_PROJECT:+1}"
+PROJECT="$(normalize_project "${OSWARM_PROJECT:-oswarm}")"; PROJECT_SET="${OSWARM_PROJECT:+1}"
 IMAGE="${OSWARM_IMAGE:-$IMAGE_DEFAULT}"; CATALOG_COMMIT="${OSWARM_CATALOG_COMMIT:-$CATALOG_COMMIT_DEFAULT}"
 BUNDLE_URL="${OSWARM_BUNDLE_URL:-$BUNDLE_URL_DEFAULT}"; INSTALLER_URL="${OSWARM_INSTALLER_URL:-$INSTALLER_URL_DEFAULT}"
 OWNER_APPS="${OSWARM_OWNER_APPLICATIONS:-}"; INITIAL_OWNER_PASSWORD=""; INITIAL_OWNER_INITIALIZED=0; CREDENTIALS_SHOWN=0
@@ -92,7 +97,7 @@ as_root() {
 }
 
 show_help() {
-  if [ -n "${BASH_SOURCE[0]:-}" ]; then sed -n '10,38p' "${BASH_SOURCE[0]}"; fi
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then sed -n '11,39p' "${BASH_SOURCE[0]}"; fi
 }
 
 ensure_tools() {
@@ -133,7 +138,7 @@ load_existing_env() {
   if [ -z "${PROJECT_SET:-}" ]; then
     saved_project="$(env_setting OSWARM_PROJECT)"
     if [ -z "$saved_project" ]; then saved_project="$(env_setting COMPOSE_PROJECT_NAME)"; fi
-    if [ -n "$saved_project" ]; then PROJECT="$saved_project"; fi
+    if [ -n "$saved_project" ]; then PROJECT="$(normalize_project "$saved_project")"; fi
   fi
 }
 
@@ -144,7 +149,7 @@ parse_arguments() {
       --dir) [ $# -ge 2 ] || die "--dir requires a value"; DIR="$2"; shift 2 ;;
       --admin) [ $# -ge 2 ] || die "--admin requires a value"; ADMIN="$2"; shift 2 ;;
       --port) [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; PORT_SET=1; shift 2 ;;
-      --project) [ $# -ge 2 ] || die "--project requires a value"; PROJECT="$2"; PROJECT_SET=1; shift 2 ;;
+      --project) [ $# -ge 2 ] || die "--project requires a value"; PROJECT="$(normalize_project "$2")"; PROJECT_SET=1; shift 2 ;;
       --image) [ $# -ge 2 ] || die "--image requires a value"; IMAGE="$2"; IMAGE_SET=1; shift 2 ;;
       --owner-apps) [ $# -ge 2 ] || die "--owner-apps requires a value"; OWNER_APPS="$2"; shift 2 ;;
       --purge) PURGE=1; shift ;;
@@ -152,8 +157,9 @@ parse_arguments() {
       *) die "unknown argument '$1' (see --help)" ;;
     esac
   done
+  PROJECT="$(normalize_project "$PROJECT")"
   [[ "$ADMIN" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "the administrator name must be 1-64 letters, digits, dot, underscore or dash"
-  [[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$ ]] || die "the project name must be 1-63 letters, digits, underscore or dash"
+  [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || die "the project name must be 1-63 letters, digits, underscore or dash"
   if ! [[ "$PORT" =~ ^[0-9]{2,5}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     die "the port must be between 1 and 65535"
   fi
@@ -363,7 +369,7 @@ cleanup_incomplete_dir() {
   local saved_project real_dir foreign_owner="" cid wdir
   saved_project="$(env_setting OSWARM_PROJECT "$DIR/.env")"
   if [ -z "$saved_project" ]; then saved_project="$(env_setting COMPOSE_PROJECT_NAME "$DIR/.env")"; fi
-  saved_project="${saved_project:-$PROJECT}"
+  saved_project="$(normalize_project "${saved_project:-$PROJECT}")"
   real_dir="$(cd "$DIR" 2>/dev/null && pwd || printf '%s' "$DIR")"
   for cid in $($DOCKER ps -a -q --filter "label=com.docker.compose.project=$saved_project" 2>/dev/null || true); do
     wdir="$($DOCKER inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$cid" 2>/dev/null || true)"
@@ -376,6 +382,8 @@ cleanup_incomplete_dir() {
 }
 
 ensure_project_free() {
+  PROJECT="$(normalize_project "$PROJECT")"
+  [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || die "the project name must be 1-63 letters, digits, underscore or dash"
   local containers volumes
   containers="$($DOCKER ps -a -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)"
   volumes="$($DOCKER volume ls -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)"
@@ -386,6 +394,7 @@ ensure_project_free() {
 
 write_configuration() {
   validate_engine_mirror
+  PROJECT="$(normalize_project "$PROJECT")"
   local staged_bundle="${1:-}" public_url="${OSWARM_PUBLIC_URL:-http://127.0.0.1:$PORT}"
   local apparmor_profile="${OSWARM_APPARMOR_PROFILE:-$APPARMOR_PROFILE_DEFAULT}"
   say "creating $DIR"

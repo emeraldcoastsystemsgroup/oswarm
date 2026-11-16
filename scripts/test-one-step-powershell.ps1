@@ -4,6 +4,7 @@ CHANGE LOG
 SEQ                 | AUTHOR                      | DESCRIPTION
 -----------------------------------------------------------------------------
 1 | maintainer@emeraldcoastsystemsgroup.com   | Real PowerShell regression guards for R2, R3, R4, and P1 in install/install.ps1
+2 | maintainer@emeraldcoastsystemsgroup.com   | Add R3b guard for capitalised OSWARM_PROJECT=Team / -Project Team against lowercase Compose project team
 #>
 param([string]$TargetInstaller = (Join-Path $PSScriptRoot '../install/install.ps1'))
 Set-StrictMode -Version Latest
@@ -78,7 +79,7 @@ Invoke-Install
         throw "R2b failed: retry did not clean up and re-run Install-Product ($($r2bRetry.Stdout) $($r2bRetry.Stderr))"
     }
 
-    # 3. R3: Colliding Docker Compose project refused before creating Dir
+    # 3. R3 & R3b: Colliding Docker Compose project refused before creating Dir (including capitalised Team vs lowercase team)
     $r3Dir = Join-Path $work 'r3-second'
     $r3 = Invoke-IsolatedPs @"
 . '$defsFile' -Dir '$r3Dir' -Port 38796 -Image 'ghcr.io/emeraldcoastsystemsgroup/oswarm:0.1.0'
@@ -88,6 +89,26 @@ Install-Product
 "@
     if ($r3.Code -eq 0 -or (Test-Path $r3Dir) -or ($r3.Stderr + $r3.Stdout) -notmatch 'OSWARM_PROJECT') {
         throw "R3 failed: colliding Compose project was not refused cleanly ($($r3.Stdout) $($r3.Stderr))"
+    }
+
+    $r3bDir = Join-Path $work 'r3b-teamC'
+    foreach ($mode in @('env','param')) {
+        $paramPart = if ($mode -eq 'param') { "-Project 'Team'" } else { '' }
+        $extra = if ($mode -eq 'env') { @{ OSWARM_PROJECT = 'Team' } } else { @{} }
+        $r3b = Invoke-IsolatedPs @"
+. '$defsFile' -Dir '$r3bDir' -Port 38796 $paramPart -Image 'ghcr.io/emeraldcoastsystemsgroup/oswarm:0.1.0'
+function Test-PortFree { return `$true }
+function docker {
+    `$global:LASTEXITCODE = 0
+    if (`$args[0] -eq 'volume' -and (`$args -join ' ') -cmatch 'label=com\.docker\.compose\.project=team$') { return 'team_postgres_state' }
+    return ''
+}
+function Get-Bundle { throw 'UNEXPECTED_BUNDLE_STAGE' }
+Install-Product
+"@ $extra
+        if ($r3b.Code -eq 0 -or (Test-Path $r3bDir) -or ($r3b.Stderr + $r3b.Stdout) -notmatch 'OSWARM_PROJECT') {
+            throw "R3b ($mode) failed: capitalised Team did not match lowercase project team ($($r3b.Stdout) $($r3b.Stderr))"
+        }
     }
 
     # 4. R4: Foreign directory with notes.txt and empty/wrong .installing is refused without deleting notes.txt

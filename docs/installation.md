@@ -68,7 +68,7 @@ The script is usually piped, so there is no prompt; set these in the environment
 | Variable | Default | Meaning |
 |---|---|---|
 | `OSWARM_DIR` | `~/oswarm` | installation directory (`%USERPROFILE%\oswarm` on Windows) |
-| `OSWARM_PROJECT` | `oswarm` | Docker Compose project name (set a distinct name for a second installation) |
+| `OSWARM_PROJECT` | `oswarm` | Docker Compose project name (normalized to lowercase; set a distinct name for a second installation) |
 | `OSWARM_ADMIN` | `admin` | administrator name (letters, digits, `.`, `_`, `-`) |
 | `OSWARM_PORT` | `38788` | the local port the kernel listens on |
 | `OSWARM_PUBLIC_URL` | `http://127.0.0.1:<OSWARM_PORT>` | the URL browsers and OAuth callbacks open |

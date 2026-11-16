@@ -5,6 +5,7 @@
  * -----------------------------------------------------------------------------
  * 1 | maintainer@emeraldcoastsystemsgroup.com   | Regression guards for one-step installer AppArmor detection, atomic staging, incomplete-install recovery, unbound USER/root handling, public URL port sync, and CLI Windows arg translation
  * 2 | maintainer@emeraldcoastsystemsgroup.com   | Add R1-R4 and P1 regression guards for non-root AppArmor policy/profiles check, early .installing token ordering, project collision refusal, foreign .installing safety, and self-rooted oswarm.sh manager
+ * 3 | maintainer@emeraldcoastsystemsgroup.com   | Add R3b regression guard for capitalised OSWARM_PROJECT=Team / --project Team collision against lowercase Compose project team
  */
 'use strict';
 const { test } = require('node:test');
@@ -281,6 +282,46 @@ install_product
       assert.match(res.stderr, /OSWARM_PROJECT/);
       assert.doesNotMatch(res.stderr, /UNEXPECTED_COMPOSE/);
       assert.equal(fs.existsSync(secondDir), false);
+    }
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test('R3b: capitalised OSWARM_PROJECT=Team and --project Team normalize to team and refuse when Compose project team has a volume', () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'oswarm-r3b-team-'));
+  try {
+    const teamBDir = path.join(work, 'teamB');
+    for (const mode of ['env', 'flag']) {
+      const res = runBashFixture(`
+OS=Linux; ARCH=x86_64
+if [ "$MODE" = "flag" ]; then
+  parse_arguments --dir "$OSWARM_DIR" --port 38796 --project Team --image ghcr.io/emeraldcoastsystemsgroup/oswarm:0.1.0
+else
+  parse_arguments --dir "$OSWARM_DIR" --port 38796 --image ghcr.io/emeraldcoastsystemsgroup/oswarm:0.1.0
+fi
+port_is_free() { return 0; }
+docker() {
+  case "$*" in
+    *"label=com.docker.compose.project=team")
+      if [ "$1" = "volume" ]; then echo "team_postgres_state"; fi
+      return 0
+      ;;
+  esac
+  return 0
+}
+fetch_bundle() { echo "UNEXPECTED_BUNDLE_FETCH" >&2; return 98; }
+compose() { echo "UNEXPECTED_COMPOSE:$*" >&2; return 99; }
+install_product
+`, {
+        OSWARM_DIR: teamBDir,
+        MODE: mode,
+        ...(mode === 'env' ? { OSWARM_PROJECT: 'Team' } : {}),
+      });
+      assert.notEqual(res.status, 0, `expected refusal for Team via ${mode}`);
+      assert.match(res.stderr, /OSWARM_PROJECT/);
+      assert.doesNotMatch(res.stderr, /UNEXPECTED_BUNDLE_FETCH|UNEXPECTED_COMPOSE/);
+      assert.equal(fs.existsSync(teamBDir), false);
     }
   } finally {
     fs.rmSync(work, { recursive: true, force: true });

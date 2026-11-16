@@ -6,6 +6,7 @@ SEQ                 | AUTHOR                      | DESCRIPTION
 1 | maintainer@emeraldcoastsystemsgroup.com   | Initial implementation
 2 | maintainer@emeraldcoastsystemsgroup.com   | Harden piped strict-mode defaults, atomic install state, credential recovery, upgrade .env rewrite, public URL port sync, and owner-apps parity
 3 | maintainer@emeraldcoastsystemsgroup.com   | Validate OSWARM_ENGINE_MIRROR upfront, write tokenized .installing before config files, refuse colliding Compose projects, and self-root copied oswarm.ps1
+4 | maintainer@emeraldcoastsystemsgroup.com   | Normalize OSWARM_PROJECT / -Project to lowercase so Compose project checks match capitalised inputs
 
 oswarm: one command installs the dependencies and the product, on Windows.
 
@@ -60,6 +61,7 @@ $InstallingToken = 'oswarm-incomplete-install-v1'
 $ScriptRoot = if (Test-Path Variable:\PSScriptRoot) { $PSScriptRoot } else { '' }
 $PortSet = $PSBoundParameters.ContainsKey('Port') -or [bool]$env:OSWARM_PORT
 $ProjectSet = $PSBoundParameters.ContainsKey('Project') -or [bool]$env:OSWARM_PROJECT
+$Project = "$Project".Trim().ToLowerInvariant()
 $ImageSet = [bool]$Image
 if (-not $Image) { $Image = $ImageDefault }
 $script:GeneratedPassword = ''
@@ -85,12 +87,13 @@ function Invoke-Docker([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { Fail "docker $($Arguments -join ' ') failed: $output" }
     return $output
 }
+function Format-ProjectName([string]$Value) { return "$Value".Trim().ToLowerInvariant() }
 function Invoke-Compose([string[]]$Arguments, [string]$ProjectName = $Project) {
     $composeFile = Join-Path $Dir 'compose.yaml'
     $hadPrev = Test-Path Env:\OSWARM_PROJECT
     $prev = if ($hadPrev) { $env:OSWARM_PROJECT } else { '' }
     try {
-        $env:OSWARM_PROJECT = $ProjectName
+        $env:OSWARM_PROJECT = Format-ProjectName $ProjectName
         & docker compose --project-directory $Dir -f $composeFile @Arguments
         if ($LASTEXITCODE -ne 0) { Fail "docker compose $($Arguments -join ' ') failed" }
     } finally {
@@ -114,13 +117,14 @@ function Read-ExistingEnv {
     if (-not $ProjectSet) {
         $savedProject = Get-EnvSetting 'OSWARM_PROJECT'
         if (-not $savedProject) { $savedProject = Get-EnvSetting 'COMPOSE_PROJECT_NAME' }
-        if ($savedProject) { $script:Project = $savedProject }
+        if ($savedProject) { $script:Project = Format-ProjectName $savedProject }
     }
 }
 
 function Confirm-Inputs {
+    $script:Project = Format-ProjectName $Project
     if ($Admin -notmatch '^[A-Za-z0-9._-]{1,64}$') { Fail 'the administrator name must be 1-64 letters, digits, dot, underscore or dash' }
-    if ($Project -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$') { Fail 'the project name must be 1-63 letters, digits, underscore or dash' }
+    if ($Project -cnotmatch '^[a-z0-9][a-z0-9_-]{0,62}$') { Fail 'the project name must be 1-63 letters, digits, underscore or dash' }
     if ($Port -lt 1 -or $Port -gt 65535) { Fail 'the port must be between 1 and 65535' }
     if ($CatalogCommit -notmatch '^[0-9a-f]{40}$') { Fail 'OSWARM_CATALOG_COMMIT must be a full 40-character commit' }
     if ($env:OSWARM_ENGINE_MIRROR) {
@@ -303,6 +307,7 @@ function Remove-IncompleteInstall {
     $savedProject = Get-EnvSetting 'OSWARM_PROJECT'
     if (-not $savedProject) { $savedProject = Get-EnvSetting 'COMPOSE_PROJECT_NAME' }
     if (-not $savedProject) { $savedProject = $Project }
+    $savedProject = Format-ProjectName $savedProject
     $realDir = [IO.Path]::GetFullPath($Dir)
     $foreignOwner = ''
     $ids = (& docker ps -a -q --filter "label=com.docker.compose.project=$savedProject" 2>$null | Out-String).Split("`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
@@ -317,6 +322,8 @@ function Remove-IncompleteInstall {
 }
 
 function Confirm-ProjectFree {
+    $script:Project = Format-ProjectName $Project
+    if ($Project -cnotmatch '^[a-z0-9][a-z0-9_-]{0,62}$') { Fail 'the project name must be 1-63 letters, digits, underscore or dash' }
     $containers = (& docker ps -a -q --filter "label=com.docker.compose.project=$Project" 2>$null | Out-String).Trim()
     $volumes = (& docker volume ls -q --filter "label=com.docker.compose.project=$Project" 2>$null | Out-String).Trim()
     if ($containers -or $volumes) {
@@ -326,6 +333,7 @@ function Confirm-ProjectFree {
 
 function Write-Configuration([string]$StagedBundle = '') {
     Confirm-Inputs
+    $script:Project = Format-ProjectName $Project
     Say "creating $Dir"
     New-Item -ItemType Directory -Path $Dir | Out-Null
     if ($env:OS -eq 'Windows_NT') { Protect-Directory $Dir }
