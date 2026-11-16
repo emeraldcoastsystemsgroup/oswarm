@@ -67,14 +67,20 @@ The script is usually piped, so there is no prompt; set these in the environment
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OSWARM_DIR` | `~/oswarm` | installation directory |
+| `OSWARM_DIR` | `~/oswarm` | installation directory (`%USERPROFILE%\oswarm` on Windows) |
+| `OSWARM_PROJECT` | `oswarm` | Docker Compose project name (normalized to lowercase; set a distinct name for a second installation) |
 | `OSWARM_ADMIN` | `admin` | administrator name (letters, digits, `.`, `_`, `-`) |
 | `OSWARM_PORT` | `38788` | the local port the kernel listens on |
+| `OSWARM_PUBLIC_URL` | `http://127.0.0.1:<OSWARM_PORT>` | the URL browsers and OAuth callbacks open |
 | `OSWARM_ADMIN_PASSWORD` | generated | your own first password, 12 to 1024 bytes; used once, never written |
 | `OSWARM_IMAGE` | the version's image | another kernel image reference |
 | `OSWARM_CATALOG_COMMIT` | pinned in the script | another full commit of the public catalog |
+| `OSWARM_CATALOG_URL` | GitHub tarball of `OSWARM_CATALOG_COMMIT` | custom archive URL for reviewed catalog staging |
+| `OSWARM_OWNER_APPLICATIONS` | unset | `engineering` or comma-separated engineering apps for first-owner setup |
+| `OSWARM_APPARMOR_PROFILE` | `oshal-bwrap` (`unconfined` when AppArmor securityfs is absent) | AppArmor profile for the kernel container on Linux |
 | `OSWARM_NO_BROWSER` | unset | `1` leaves the browser closed |
 | `OSWARM_BUNDLE_URL` | `https://oswarm.ai/install` | where `compose.yaml`, the seccomp policy and the env template come from |
+| `OSWARM_INSTALLER_URL` | `https://oswarm.ai/install.sh` (`install.ps1` on Windows) | where the saved management script is downloaded from when piped |
 
 For example: `OSWARM_ADMIN=parent OSWARM_PORT=38789 bash -c "$(curl -fsSL https://oswarm.ai/install.sh)"`.
 In PowerShell: `$env:OSWARM_ADMIN='parent'; irm https://oswarm.ai/install.ps1 | iex`.

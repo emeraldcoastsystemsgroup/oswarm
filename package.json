@@ -22,7 +22,7 @@
     "url": "https://github.com/emeraldcoastsystemsgroup/oswarm.git"
   },
   "scripts": {
-    "test": "node --test scripts/installer-*.test.cjs scripts/kubernetes-installer.test.cjs",
+    "test": "node --test scripts/installer-*.test.cjs scripts/owner-applications.test.cjs scripts/kubernetes-installer.test.cjs",
     "prepublishOnly": "node scripts/check-image-release.cjs"
   },
   "publishConfig": {

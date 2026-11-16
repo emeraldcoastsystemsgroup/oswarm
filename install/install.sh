@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# CHANGE LOG
+# -----------------------------------------------------------------------------
+# SEQ                 | AUTHOR                      | DESCRIPTION
+# -----------------------------------------------------------------------------
+# 1 | maintainer@emeraldcoastsystemsgroup.com   | Initial implementation
+# 2 | maintainer@emeraldcoastsystemsgroup.com   | Harden AppArmor detection, atomic install state, root/unbound-env handling, and port-matched public URL
+# 3 | maintainer@emeraldcoastsystemsgroup.com   | Check AppArmor policy/profiles for non-root re-runs, write tokenized .installing before config files, refuse colliding Compose projects, and self-root copied oswarm.sh
+# 4 | maintainer@emeraldcoastsystemsgroup.com   | Normalize OSWARM_PROJECT / --project to lowercase so Compose project checks match capitalised inputs
+#
 # oswarm: one command installs the dependencies and the product.
 #
 #   curl -fsSL https://oswarm.ai/install.sh | bash
@@ -15,8 +24,10 @@
 # Settings are environment variables (the script is usually piped, so there is no prompt):
 #   OSWARM_DIR=~/oswarm           installation directory      OSWARM_ADMIN=admin   administrator
 #   OSWARM_PORT=38788             local port                  OSWARM_ADMIN_PASSWORD=...  use this
-#   OSWARM_IMAGE=...              kernel image reference      instead of generating one
-#   OSWARM_CATALOG_COMMIT=...     application catalog commit  OSWARM_NO_BROWSER=1  do not open
+#   OSWARM_PROJECT=oswarm         Docker Compose project      instead of generating one
+#   OSWARM_IMAGE=...              kernel image reference      OSWARM_NO_BROWSER=1  do not open
+#   OSWARM_PUBLIC_URL=...         public URL (defaults to http://127.0.0.1:$OSWARM_PORT)
+#   OSWARM_CATALOG_COMMIT=...     application catalog commit
 #   OSWARM_OWNER_APPLICATIONS=engineering (or comma-separated engineering apps): set up only
 #      these applications for the first owner through their current reviewed roles.
 #   OSWARM_BUNDLE_URL=...         where compose.yaml and the policy files come from
@@ -36,16 +47,33 @@ CATALOG_COMMIT_DEFAULT="3a0e0764f143472ac3f181bd0f98127cc23dd90b"
 BUNDLE_URL_DEFAULT="https://oswarm.ai/install"
 INSTALLER_URL_DEFAULT="https://oswarm.ai/install.sh"
 BUNDLE_FILES="compose.yaml seccomp-bwrap.json env.example image-release.env image-loader.sh"
+INSTALLING_TOKEN="oswarm-incomplete-install-v1"
 
-DIR="${OSWARM_DIR:-$HOME/oswarm}"; ADMIN="${OSWARM_ADMIN:-admin}"; PORT="${OSWARM_PORT:-38788}"
+normalize_project() {
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+HOME="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || echo /root)}"
+CURRENT_USER="${USER:-$(id -un 2>/dev/null || echo root)}"
+SELF_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "$(basename "${BASH_SOURCE[0]}")" = "oswarm.sh" ]; then
+  SELF_DIR="$(if cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null; then pwd; fi)"
+fi
+DIR="${OSWARM_DIR:-${SELF_DIR:-$HOME/oswarm}}"
+ADMIN="${OSWARM_ADMIN:-admin}"; PORT="${OSWARM_PORT:-38788}"; PORT_SET="${OSWARM_PORT:+1}"
+PROJECT="$(normalize_project "${OSWARM_PROJECT:-oswarm}")"; PROJECT_SET="${OSWARM_PROJECT:+1}"
 IMAGE="${OSWARM_IMAGE:-$IMAGE_DEFAULT}"; CATALOG_COMMIT="${OSWARM_CATALOG_COMMIT:-$CATALOG_COMMIT_DEFAULT}"
 BUNDLE_URL="${OSWARM_BUNDLE_URL:-$BUNDLE_URL_DEFAULT}"; INSTALLER_URL="${OSWARM_INSTALLER_URL:-$INSTALLER_URL_DEFAULT}"
 OWNER_APPS="${OSWARM_OWNER_APPLICATIONS:-}"; INITIAL_OWNER_PASSWORD=""; INITIAL_OWNER_INITIALIZED=0; CREDENTIALS_SHOWN=0
-PROJECT="${OSWARM_PROJECT:-oswarm}"; DOCKER="docker"; PURGE=0; ACTION="install"; GENERATED_PASSWORD=""; IMAGE_SET="${OSWARM_IMAGE:+1}"
+DOCKER="docker"; PURGE=0; ACTION="install"; GENERATED_PASSWORD=""; IMAGE_SET="${OSWARM_IMAGE:+1}"
+APPARMOR_PROFILE_DEFAULT="oshal-bwrap"; BUNDLE_STAGE=""
 OS="$(uname -s)"; ARCH="$(uname -m)"
 
 say() { printf '\n== %s\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
+cleanup_bundle_stage() {
+  if [ -n "${BUNDLE_STAGE:-}" ]; then rm -rf "$BUNDLE_STAGE"; BUNDLE_STAGE=""; fi
+}
 show_initial_credentials() {
   if [ "${INITIAL_OWNER_INITIALIZED:-0}" = 1 ] && [ -n "${GENERATED_PASSWORD:-}" ] && [ "${CREDENTIALS_SHOWN:-0}" = 0 ]; then
     printf '\nAdministrator:   %s\nPassword:        %s\n' "$ADMIN" "$GENERATED_PASSWORD"
@@ -54,30 +82,89 @@ show_initial_credentials() {
   fi
 }
 installation_error() {
+  cleanup_bundle_stage
   printf '\noswarm: failed at line %s: %s\n' "$1" "$2" >&2
   show_initial_credentials
 }
-die() { printf '\noswarm: %s\n' "$*" >&2; show_initial_credentials; exit 1; }
-compose() { (cd "$DIR" && $DOCKER compose "$@"); }
+die() { trap - ERR; cleanup_bundle_stage; printf '\noswarm: %s\n' "$*" >&2; show_initial_credentials; exit 1; }
+compose() { OSWARM_PROJECT="$PROJECT" $DOCKER compose --project-directory "$DIR" -f "$DIR/compose.yaml" "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif have sudo; then sudo "$@"
+  else die "root privileges or sudo are required to run: $*"
+  fi
+}
+
+show_help() {
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then sed -n '11,39p' "${BASH_SOURCE[0]}"; fi
+}
+
+ensure_tools() {
+  local tool
+  for tool in curl tar gzip; do
+    have "$tool" || die "$tool is required to install oswarm"
+  done
+}
+
+validate_engine_mirror() {
+  [ -n "${OSWARM_ENGINE_MIRROR:-}" ] || return 0
+  case "$OSWARM_ENGINE_MIRROR" in
+    *[[:cntrl:]]*) die "OSWARM_ENGINE_MIRROR must be a single-line JSON object" ;;
+    \{*\}) ;;
+    *) die "OSWARM_ENGINE_MIRROR must be a single-line JSON object" ;;
+  esac
+  if have python3; then
+    python3 -c 'import json,sys; sys.exit(0 if isinstance(json.loads(sys.argv[1]), dict) else 1)' "$OSWARM_ENGINE_MIRROR" >/dev/null 2>&1 \
+      || die "OSWARM_ENGINE_MIRROR must be a single-line JSON object"
+  elif have node; then
+    node -e 'const v=JSON.parse(process.argv[1]);if(!v||typeof v!=="object"||Array.isArray(v))process.exit(1)' "$OSWARM_ENGINE_MIRROR" >/dev/null 2>&1 \
+      || die "OSWARM_ENGINE_MIRROR must be a single-line JSON object"
+  fi
+}
+
+env_setting() {
+  local key="$1" file="${2:-$DIR/.env}"
+  [ -f "$file" ] || return 0
+  grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+load_existing_env() {
+  local saved_port saved_project
+  if [ -z "${PORT_SET:-}" ]; then
+    saved_port="$(env_setting OSWARM_PORT)"
+    if [ -n "$saved_port" ]; then PORT="$saved_port"; fi
+  fi
+  if [ -z "${PROJECT_SET:-}" ]; then
+    saved_project="$(env_setting OSWARM_PROJECT)"
+    if [ -z "$saved_project" ]; then saved_project="$(env_setting COMPOSE_PROJECT_NAME)"; fi
+    if [ -n "$saved_project" ]; then PROJECT="$(normalize_project "$saved_project")"; fi
+  fi
+}
 
 parse_arguments() {
   while [ $# -gt 0 ]; do
     case "$1" in
       install|prepare|status|start|stop|restart|logs|upgrade|uninstall) ACTION="$1"; shift ;;
-      --dir) DIR="$2"; shift 2 ;;
-      --admin) ADMIN="$2"; shift 2 ;;
-      --port) PORT="$2"; shift 2 ;;
-      --image) IMAGE="$2"; IMAGE_SET=1; shift 2 ;;
-      --owner-apps) OWNER_APPS="$2"; shift 2 ;;
+      --dir) [ $# -ge 2 ] || die "--dir requires a value"; DIR="$2"; shift 2 ;;
+      --admin) [ $# -ge 2 ] || die "--admin requires a value"; ADMIN="$2"; shift 2 ;;
+      --port) [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; PORT_SET=1; shift 2 ;;
+      --project) [ $# -ge 2 ] || die "--project requires a value"; PROJECT="$(normalize_project "$2")"; PROJECT_SET=1; shift 2 ;;
+      --image) [ $# -ge 2 ] || die "--image requires a value"; IMAGE="$2"; IMAGE_SET=1; shift 2 ;;
+      --owner-apps) [ $# -ge 2 ] || die "--owner-apps requires a value"; OWNER_APPS="$2"; shift 2 ;;
       --purge) PURGE=1; shift ;;
-      -h|--help) [ -n "${BASH_SOURCE[0]:-}" ] && sed -n '2,27p' "${BASH_SOURCE[0]}"; exit 0 ;;
+      -h|--help) show_help; exit 0 ;;
       *) die "unknown argument '$1' (see --help)" ;;
     esac
   done
+  PROJECT="$(normalize_project "$PROJECT")"
   [[ "$ADMIN" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "the administrator name must be 1-64 letters, digits, dot, underscore or dash"
-  [[ "$PORT" =~ ^[0-9]{2,5}$ ]] || die "the port must be a number"
+  [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || die "the project name must be 1-63 letters, digits, underscore or dash"
+  if ! [[ "$PORT" =~ ^[0-9]{2,5}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "the port must be between 1 and 65535"
+  fi
   [[ "$CATALOG_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "OSWARM_CATALOG_COMMIT must be a full 40-character commit"
+  validate_engine_mirror
   if [ -n "$OWNER_APPS" ]; then
     case ",$OWNER_APPS," in *,,*) die "owner-apps contains an empty application" ;; esac
     local selected_app
@@ -95,20 +182,24 @@ parse_arguments() {
 docker_works() { $DOCKER info --format '{{.OSType}}' 2>/dev/null | grep -qx linux; }
 
 wait_docker() {
-  local i
-  for i in $(seq 1 90); do docker_works && return 0; sleep 2; done
+  for _ in $(seq 1 90); do
+    if docker_works; then return 0; fi
+    sleep 2
+  done
   die "Docker did not start within three minutes; start it, then run this installer again"
 }
 
 install_docker_linux() {
-  say "installing Docker Engine (Docker's own install script; sudo will ask for your password)"
+  say "installing Docker Engine (Docker's own install script)"
   have curl || die "curl is required to download Docker's install script"
   local script; script="$(mktemp)"
   curl -fsSL https://get.docker.com -o "$script"
-  sudo sh "$script"; rm -f "$script"
-  if have systemctl; then sudo systemctl enable --now docker >/dev/null 2>&1 || true; fi
-  sudo usermod -aG docker "$USER" 2>/dev/null || true
-  note "your account was added to the docker group; it applies to new logins. This run uses sudo."
+  as_root sh "$script"; rm -f "$script"
+  if have systemctl; then as_root systemctl enable --now docker >/dev/null 2>&1 || true; fi
+  if [ "$(id -u)" -ne 0 ] && [ -n "$CURRENT_USER" ]; then
+    as_root usermod -aG docker "$CURRENT_USER" 2>/dev/null || true
+    note "your account ($CURRENT_USER) was added to the docker group; it applies to new logins. This run uses sudo."
+  fi
 }
 
 install_docker_macos() {
@@ -118,11 +209,11 @@ install_docker_macos() {
     brew install --cask docker-desktop 2>/dev/null || brew install --cask docker
   else
     local dmg="/tmp/Docker-oswarm.dmg" url="https://desktop.docker.com/mac/main/${ARCH}/Docker.dmg"
-    [ "$ARCH" = amd64 ] && url="https://desktop.docker.com/mac/main/amd64/Docker.dmg"
+    if [ "$ARCH" = amd64 ]; then url="https://desktop.docker.com/mac/main/amd64/Docker.dmg"; fi
     note "downloading $url"
     curl -fL --progress-bar "$url" -o "$dmg"
     hdiutil attach -nobrowse -quiet "$dmg"
-    sudo cp -R /Volumes/Docker/Docker.app /Applications/
+    as_root cp -R /Volumes/Docker/Docker.app /Applications/
     hdiutil detach -quiet /Volumes/Docker; rm -f "$dmg"
   fi
   open -a Docker
@@ -136,12 +227,17 @@ ensure_docker() {
   fi
   if ! docker_works; then
     if [ "$OS" = Linux ]; then
-      # Either this account cannot reach the socket yet (new docker group) or the engine is stopped.
-      note "Docker is installed but not reachable as $USER; trying with sudo"
-      if sudo docker info >/dev/null 2>&1; then DOCKER="sudo docker"
+      if [ "$(id -u)" -eq 0 ]; then
+        if have systemctl; then systemctl start docker >/dev/null 2>&1 || true; fi
+        wait_docker
       else
-        have systemctl && sudo systemctl start docker >/dev/null 2>&1 || true
-        DOCKER="sudo docker"; wait_docker
+        note "Docker is installed but not reachable as $CURRENT_USER; trying with sudo"
+        have sudo || die "Docker is not reachable as $CURRENT_USER and sudo is not installed"
+        if sudo docker info >/dev/null 2>&1; then DOCKER="sudo docker"
+        else
+          if have systemctl; then sudo systemctl start docker >/dev/null 2>&1 || true; fi
+          DOCKER="sudo docker"; wait_docker
+        fi
       fi
     else
       open -a Docker 2>/dev/null || die "Docker Desktop is installed but not running and could not be started"
@@ -172,22 +268,40 @@ policy_body() { grep -v -E '^[[:space:]]*(#|$)' "$1"; }
 ensure_sandbox_policy() {
   [ "$OS" = Linux ] || return 0
   say "checking the application sandbox policy"
-  if [ ! -d /sys/module/apparmor ] || ! have apparmor_parser; then
+  local module_dir="${OSWARM_APPARMOR_MODULE_DIR:-/sys/module/apparmor}"
+  local securityfs_dir="${OSWARM_APPARMOR_SECURITYFS_DIR:-/sys/kernel/security/apparmor}"
+  local destination="${OSWARM_APPARMOR_DEST:-/etc/apparmor.d/oshal-bwrap}"
+  if [ ! -d "$module_dir" ] || [ "$(cat "$module_dir/parameters/enabled" 2>/dev/null || true)" != Y ]; then
     note "this host does not use AppArmor; nothing to install"; return 0
   fi
-  local destination=/etc/apparmor.d/oshal-bwrap scratch; scratch="$(mktemp)"
+  if [ ! -d "$securityfs_dir" ] || ! have apparmor_parser; then
+    APPARMOR_PROFILE_DEFAULT="unconfined"
+    note "AppArmor policy loading is unavailable in this environment; using apparmor=unconfined"
+    return 0
+  fi
+  local scratch; scratch="$(mktemp)"
   apparmor_profile > "$scratch"
   if [ -e "$destination" ]; then
-    # Compare the policy, not its comments. A profile of this name is what the kernel container
-    # needs; one that differs was installed deliberately by something else and is left alone.
-    if [ "$(policy_body "$scratch")" = "$(policy_body "$destination")" ]; then note "the oshal-bwrap profile is already installed"
-    else note "an oshal-bwrap profile is already installed with a different body; keeping it"; fi
+    if [ "$(policy_body "$scratch")" = "$(policy_body "$destination")" ]; then
+      local listing
+      if [ -d "$securityfs_dir/policy/profiles" ] && listing="$(ls -1 "$securityfs_dir/policy/profiles" 2>/dev/null)"; then
+        if ! printf '%s\n' "$listing" | grep -q '^oshal-bwrap\.'; then
+          as_root apparmor_parser -r -K "$destination"
+        fi
+      fi
+      note "the oshal-bwrap profile is already installed"
+    else
+      note "an oshal-bwrap profile is already installed with a different body; keeping it"
+    fi
     rm -f "$scratch"; return 0
   fi
-  note "installing one AppArmor profile, $destination (sudo will ask for your password)"
-  sudo apparmor_parser -Q -K "$scratch"
-  sudo install -m 0644 "$scratch" "$destination"
-  sudo apparmor_parser -r -K "$destination"
+  note "installing one AppArmor profile, $destination"
+  if ! (as_root apparmor_parser -Q -K "$scratch" && as_root apparmor_parser -r -K "$scratch"); then
+    rm -f "$scratch"
+    die "could not load the AppArmor profile $destination"
+  fi
+  as_root mkdir -p "$(dirname "$destination")"
+  as_root install -m 0644 "$scratch" "$destination"
   rm -f "$scratch"
   note "installed; global AppArmor restrictions unchanged"
 }
@@ -195,18 +309,29 @@ ensure_sandbox_policy() {
 # ----- 3. The product -------------------------------------------------------------------------
 
 fetch_bundle() {
-  local name source here=""
-  [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/docker/compose.yaml" ] && here="$(cd "$(dirname "${BASH_SOURCE[0]}")/docker" && pwd)"
+  local target_dir="${1:-$DIR}" name source here=""
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/docker/compose.yaml" ]; then
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")/docker" && pwd)"
+  fi
   for name in $BUNDLE_FILES; do
     if [ -n "$here" ]; then
-      source="$here/$name"; [ "$name" = env.example ] && source="$here/.env.example"
-      cp "$source" "$DIR/$name"
+      source="$here/$name"
+      if [ "$name" = env.example ]; then source="$here/.env.example"; fi
+      cp "$source" "$target_dir/$name"
     else
-      curl -fsSL "$BUNDLE_URL/$name" -o "$DIR/$name" || die "could not download $BUNDLE_URL/$name"
+      curl -fsSL "$BUNDLE_URL/$name" -o "$target_dir/$name" || die "could not download $BUNDLE_URL/$name"
     fi
   done
-  if [ -n "$here" ]; then cp "${BASH_SOURCE[0]}" "$DIR/oswarm.sh"; else curl -fsSL "$INSTALLER_URL" -o "$DIR/oswarm.sh" || die "could not download $INSTALLER_URL"; fi
-  chmod 0755 "$DIR/oswarm.sh"; chmod 0644 "$DIR/compose.yaml" "$DIR/seccomp-bwrap.json"
+  if [ -n "$here" ]; then cp "${BASH_SOURCE[0]}" "$target_dir/oswarm.sh"; else curl -fsSL "$INSTALLER_URL" -o "$target_dir/oswarm.sh" || die "could not download $INSTALLER_URL"; fi
+  chmod 0755 "$target_dir/oswarm.sh"; chmod 0644 "$target_dir/compose.yaml" "$target_dir/seccomp-bwrap.json"
+}
+
+verify_release_bundle() {
+  local DIR="$1"
+  # shellcheck disable=SC1091
+  source "$DIR/image-loader.sh"
+  [ "$(release_value IMAGE)" = "$IMAGE_DEFAULT" ] || die "this installer and its image release lock name different images; download the current installer"
+  ensure_release_image
 }
 
 random_hex() {
@@ -233,12 +358,61 @@ host_limits() {
   printf 'OSWARM_KERNEL_CPUS=%s\nOSWARM_KERNEL_MEMORY=%sm\n' "${cpus:-2}" "$memory"
 }
 
+is_incomplete_install() {
+  [ ! -L "$DIR/.installing" ] && [ -f "$DIR/.installing" ] || return 1
+  [ ! -L "$DIR/compose.yaml" ] && [ -f "$DIR/compose.yaml" ] || return 1
+  [ "$(cat "$DIR/.installing" 2>/dev/null || true)" = "$INSTALLING_TOKEN" ]
+}
+
+cleanup_incomplete_dir() {
+  note "cleaning up an incomplete earlier installation in $DIR"
+  local saved_project real_dir foreign_owner="" cid wdir
+  saved_project="$(env_setting OSWARM_PROJECT "$DIR/.env")"
+  if [ -z "$saved_project" ]; then saved_project="$(env_setting COMPOSE_PROJECT_NAME "$DIR/.env")"; fi
+  saved_project="$(normalize_project "${saved_project:-$PROJECT}")"
+  real_dir="$(cd "$DIR" 2>/dev/null && pwd || printf '%s' "$DIR")"
+  for cid in $($DOCKER ps -a -q --filter "label=com.docker.compose.project=$saved_project" 2>/dev/null || true); do
+    wdir="$($DOCKER inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$cid" 2>/dev/null || true)"
+    if [ -n "$wdir" ] && [ "$wdir" != "$real_dir" ]; then foreign_owner="$wdir"; break; fi
+  done
+  if [ -z "$foreign_owner" ]; then
+    PROJECT="$saved_project" compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+  fi
+  rm -rf "$DIR"
+}
+
+ensure_project_free() {
+  PROJECT="$(normalize_project "$PROJECT")"
+  [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || die "the project name must be 1-63 letters, digits, underscore or dash"
+  local containers volumes
+  containers="$($DOCKER ps -a -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)"
+  volumes="$($DOCKER volume ls -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)"
+  if [ -n "$containers" ] || [ -n "$volumes" ]; then
+    die "Docker Compose project '$PROJECT' already has containers or volumes on this machine; set OSWARM_PROJECT (or pass --project) to a distinct project name for a second installation"
+  fi
+}
+
 write_configuration() {
+  validate_engine_mirror
+  PROJECT="$(normalize_project "$PROJECT")"
+  local staged_bundle="${1:-}" public_url="${OSWARM_PUBLIC_URL:-http://127.0.0.1:$PORT}"
+  local apparmor_profile="${OSWARM_APPARMOR_PROFILE:-$APPARMOR_PROFILE_DEFAULT}"
   say "creating $DIR"
   umask 077
   mkdir -p "$DIR/applications"
-  fetch_bundle
-  { cat "$DIR/env.example"; echo; echo "# written by the installer"; echo "OSWARM_PORT=$PORT"; echo "OSWARM_IMAGE=$IMAGE"; echo "OSWARM_PROJECT=$PROJECT"; } > "$DIR/.env"
+  printf '%s\n' "$INSTALLING_TOKEN" > "$DIR/.installing"
+  chmod 0600 "$DIR/.installing"
+  if [ -n "$staged_bundle" ]; then cp -Rp "$staged_bundle"/. "$DIR"/; else fetch_bundle "$DIR"; fi
+  {
+    cat "$DIR/env.example"
+    echo
+    echo "# written by the installer"
+    echo "OSWARM_PORT=$PORT"
+    echo "OSWARM_PUBLIC_URL=$public_url"
+    echo "OSWARM_IMAGE=$IMAGE"
+    echo "OSWARM_PROJECT=$PROJECT"
+    echo "OSWARM_APPARMOR_PROFILE=$apparmor_profile"
+  } > "$DIR/.env"
   host_limits >> "$DIR/.env"
   rm -f "$DIR/env.example"
   local dbpass; dbpass="$(random_hex)"
@@ -246,7 +420,6 @@ write_configuration() {
   printf 'OSHAL_ADMIN_SUBJECT=%s\nOSHAL_ADMIN_TOKEN=%s\nOSHAL_VAULT_KEY=%s\nOSHAL_POSTGRES=postgresql://postgres:%s@postgres:5432/oshal\n' \
     "$ADMIN" "$(random_hex)" "$(random_hex)" "$dbpass" > "$DIR/runtime.env"
   if [ -n "${OSWARM_ENGINE_MIRROR:-}" ]; then
-    case "$OSWARM_ENGINE_MIRROR" in *[[:cntrl:]]*) die "engine mirror must be one line of JSON" ;; esac
     printf 'OSHAL_ENGINE_MIRROR=%s\n' "$OSWARM_ENGINE_MIRROR" >> "$DIR/runtime.env"
   fi
   chmod 0600 "$DIR/.env" "$DIR/postgres.env" "$DIR/runtime.env"
@@ -254,9 +427,9 @@ write_configuration() {
 }
 
 wait_ready() {
-  local url="http://127.0.0.1:$PORT/readyz" i
-  for i in $(seq 1 90); do
-    curl --fail --silent --max-time 2 "$url" >/dev/null 2>&1 && return 0
+  local url="http://127.0.0.1:$PORT/readyz"
+  for _ in $(seq 1 90); do
+    if curl --fail --silent --max-time 2 "$url" >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
   die "the kernel did not become ready at $url; inspect: $DIR/oswarm.sh logs"
@@ -266,23 +439,18 @@ port_is_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
 
 install_product() {
   port_is_free || die "port $PORT is already in use on this machine; set OSWARM_PORT to another port"
+  ensure_project_free
   local password
   if [ -n "${OSWARM_ADMIN_PASSWORD:-}" ]; then password="$OSWARM_ADMIN_PASSWORD"; else password="$(random_password)"; GENERATED_PASSWORD="$password"; fi
   local bytes; bytes="$(printf '%s' "$password" | wc -c | tr -d ' ')"
-  [ "$bytes" -ge 12 ] && [ "$bytes" -le 1024 ] || die "OSWARM_ADMIN_PASSWORD must be 12 to 1024 UTF-8 bytes"
-  if [ -z "$IMAGE_SET" ]; then
-    # Pull and verify before writing any installation state. A failed download
-    # can be retried with the same command without creating a half-installation.
-    (
-      DIR="$(mktemp -d "${TMPDIR:-/tmp}/oswarm-server.XXXXXX")"
-      trap 'rm -rf "$DIR"' EXIT
-      fetch_bundle
-      source "$DIR/image-loader.sh"
-      [ "$(release_value IMAGE)" = "$IMAGE_DEFAULT" ] || die "this installer and its image release lock name different images; download the current installer"
-      ensure_release_image
-    )
-  fi
-  write_configuration
+  if [ "$bytes" -lt 12 ] || [ "$bytes" -gt 1024 ]; then die "OSWARM_ADMIN_PASSWORD must be 12 to 1024 UTF-8 bytes"; fi
+  # Stage the bundle and verify any pinned release image before creating $DIR, so a failed
+  # download leaves nothing behind and can be retried cleanly with the same command.
+  BUNDLE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/oswarm-bundle.XXXXXX")"
+  fetch_bundle "$BUNDLE_STAGE"
+  if [ -z "$IMAGE_SET" ]; then verify_release_bundle "$BUNDLE_STAGE"; fi
+  write_configuration "$BUNDLE_STAGE"
+  cleanup_bundle_stage
   say "downloading the kernel image and PostgreSQL"
   if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then note "$IMAGE is already present"; compose pull --quiet postgres; else compose pull --quiet; fi
   say "starting PostgreSQL"
@@ -294,6 +462,9 @@ install_product() {
   INITIAL_OWNER_INITIALIZED=1
   INITIAL_OWNER_PASSWORD="$password"
   password=""
+  printf '{"version":1,"admin":%s}\n' "$(json_string "$ADMIN")" > "$DIR/installation.json"
+  chmod 0600 "$DIR/installation.json"
+  rm -f "$DIR/.installing"
   say "starting the kernel"
   compose up -d kernel
   wait_ready
@@ -315,7 +486,7 @@ stage_catalog() {
   local stage; stage="$(mktemp -d "$DIR/.catalog-stage.XXXXXX")"
   curl -fsSL "${OSWARM_CATALOG_URL:-https://codeload.github.com/emeraldcoastsystemsgroup/oshal-apps/tar.gz/$CATALOG_COMMIT}" -o "$stage/catalog.tar.gz" \
     || { rm -rf "$stage"; die "could not download the catalog at $CATALOG_COMMIT"; }
-  if tar -tzvf "$stage/catalog.tar.gz" | awk '{print substr($1,1,1)}' | grep -q '^l'; then rm -rf "$stage"; die "that catalog revision contains links; refusing"; fi
+  if tar -tzvf "$stage/catalog.tar.gz" | awk '{print substr($1,1,1)}' | grep -qE '^[lh]'; then rm -rf "$stage"; die "that catalog revision contains links; refusing"; fi
   mkdir "$stage/source"
   tar -xzf "$stage/catalog.tar.gz" -C "$stage/source" --strip-components=1
   printf '{"version":1,"origin":"%s","reference":"%s","commit":"%s","provenance":"reconstructed-from-origin"}\n' "$CATALOG_REPO" "$CATALOG_COMMIT" "$CATALOG_COMMIT" > "$stage/source/native-source-origin.json"
@@ -363,13 +534,18 @@ provision_initial_owner() {
 }
 
 do_install() {
+  ensure_tools
   ensure_docker
   ensure_sandbox_policy
-  if [ -f "$DIR/runtime.env" ]; then
+  if is_incomplete_install; then
+    cleanup_incomplete_dir
+  fi
+  if [ -f "$DIR/runtime.env" ] && [ ! -e "$DIR/.installing" ]; then
+    load_existing_env
     say "$DIR is already an installation; starting it (passwords and data are never reset)"
     compose up -d; wait_ready
   else
-    [ -e "$DIR" ] && die "$DIR exists but is not an oswarm installation; choose another OSWARM_DIR"
+    if [ -e "$DIR" ]; then die "$DIR exists but is not an oswarm installation; choose another OSWARM_DIR"; fi
     install_product
   fi
   stage_catalog
@@ -392,7 +568,7 @@ do_uninstall() {
 day_two() {
   [ -f "$DIR/compose.yaml" ] || die "$DIR is not an oswarm installation; run the installer first"
   ensure_docker >/dev/null
-  PORT="$(grep '^OSWARM_PORT=' "$DIR/.env" | tail -1 | cut -d= -f2-)"; PORT="${PORT:-38788}"
+  load_existing_env
   case "$ACTION" in
     status) compose ps; curl --silent --max-time 2 "http://127.0.0.1:$PORT/readyz" || true; echo ;;
     start) compose up -d; wait_ready; echo "ready: http://127.0.0.1:$PORT/login" ;;
@@ -401,7 +577,8 @@ day_two() {
     logs) compose logs --tail 200 kernel ;;
     upgrade)
       if [ -z "$IMAGE_SET" ]; then
-        fetch_bundle
+        fetch_bundle "$DIR"
+        # shellcheck disable=SC1091
         source "$DIR/image-loader.sh"; ensure_release_image; IMAGE_SET=1
       fi
       if [ -n "$IMAGE_SET" ]; then
@@ -409,7 +586,7 @@ day_two() {
         mv "$DIR/.env.next" "$DIR/.env"; chmod 0600 "$DIR/.env"
       fi
       # An installation from before the kernel ran engines still has the old 2 GB ceiling.
-      if [ "$(grep '^OSWARM_KERNEL_MEMORY=' "$DIR/.env" | tail -1 | cut -d= -f2-)" = 2g ]; then host_limits >> "$DIR/.env"; fi
+      if [ "$(env_setting OSWARM_KERNEL_MEMORY)" = 2g ]; then host_limits >> "$DIR/.env"; fi
       if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then compose pull --quiet postgres; else compose pull --quiet; fi
       compose up -d; wait_ready; echo "upgraded: $(curl --silent --max-time 2 "http://127.0.0.1:$PORT/version")" ;;
     uninstall) do_uninstall ;;
